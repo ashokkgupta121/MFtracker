@@ -852,8 +852,20 @@ class MFTracker(QMainWindow):
         self.table.setStyleSheet(self.table.styleSheet() +
             "QTableWidget { alternate-background-color: #161b22; }")
         self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(False)   # disable Qt built-in sort — we handle it manually
         self.table.doubleClicked.connect(lambda: self._edit_fund())
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        # Sorting — use sectionPressed which fires reliably regardless of setSortingEnabled
+        self._sort_col = None
+        self._sort_asc = True
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionsClickable(True)
+        hdr.sectionClicked.connect(self._on_header_clicked)
+        hdr.setStyleSheet(
+            "QHeaderView::section { background: #161b22; color: #8b949e; padding: 8px; "
+            "border: none; border-bottom: 1px solid #30363d; font-weight: bold; font-size: 12px; }"
+            "QHeaderView::section:hover { background: #21262d; color: #e6edf3; }"
+        )
         ptab_layout.addWidget(self.table)
         self.tabs.addTab(portfolio_tab, "📋  Portfolio")
 
@@ -1156,7 +1168,9 @@ scheme_code,name,units,purchase_nav,purchase_date
         total_inv = total_cur = 0
         all_cf = []
 
-        for fund in self.portfolio:
+        sorted_funds = self._apply_sort(self.portfolio)
+
+        for fund in sorted_funds:
             row = self.table.rowCount()
             self.table.insertRow(row)
 
@@ -1203,15 +1217,73 @@ scheme_code,name,units,purchase_nav,purchase_date
             self.table.setItem(row, 10, xi_item)
 
         # Summary cards — always show portfolio totals after a full table refresh
+        self._update_header_indicators()
         self._update_cards_portfolio()
         self._populate_fund_selector()
+
+    def _on_header_clicked(self, col):
+        """Toggle sort direction on repeated click of same column."""
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+        self._refresh_table()
+        self.table.clearSelection()
+        self._update_cards_portfolio()
+
+    def _apply_sort(self, funds):
+        """Return funds sorted by _sort_col, or original order if no sort active."""
+        col = self._sort_col
+        if col is None:
+            return list(funds)
+
+        def sort_key(fund):
+            history     = fund.get("nav_history", [])
+            current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
+            invested    = fund["units"] * fund["purchase_nav"]
+            current_val = fund["units"] * current_nav
+            pl          = current_val - invested
+            pl_pct      = (pl / invested * 100) if invested else 0
+            cf          = [(fund["purchase_date"], -invested),
+                           (datetime.date.today().isoformat(), current_val)]
+            xi          = xirr(cf) or 0
+            keys = [
+                fund["name"].lower(),          # 0 Fund Name
+                fund["scheme_code"],            # 1 Scheme Code
+                fund["units"],                  # 2 Units
+                fund["purchase_nav"],           # 3 Buy NAV
+                fund["purchase_date"],          # 4 Buy Date
+                current_nav,                    # 5 Current NAV
+                invested,                       # 6 Invested
+                current_val,                    # 7 Current
+                pl,                             # 8 P&L ₹
+                pl_pct,                         # 9 P&L %
+                xi,                             # 10 XIRR %
+            ]
+            return keys[col]
+
+        return sorted(funds, key=sort_key, reverse=not self._sort_asc)
+
+    def _update_header_indicators(self):
+        """Show ▲ / ▼ arrow on the sorted column header."""
+        cols = ["Fund Name", "Scheme Code", "Units", "Buy NAV (₹)",
+                "Buy Date", "Current NAV (₹)", "Invested (₹)", "Current (₹)", "P&L (₹)", "P&L %", "XIRR %"]
+        for i, name in enumerate(cols):
+            if i == self._sort_col:
+                arrow = " ▲" if self._sort_asc else " ▼"
+                self.table.horizontalHeaderItem(i).setText(name + arrow)
+            else:
+                self.table.horizontalHeaderItem(i).setText(name)
 
     def _on_table_selection_changed(self):
         rows = self.table.selectionModel().selectedRows()
         if rows:
+            # Map visual row back to sorted portfolio index
             idx = rows[0].row()
-            if 0 <= idx < len(self.portfolio):
-                self._update_cards_for_fund(self.portfolio[idx])
+            sorted_funds = self._apply_sort(self.portfolio)
+            if 0 <= idx < len(sorted_funds):
+                self._update_cards_for_fund(sorted_funds[idx])
         else:
             self._update_cards_portfolio()
 
