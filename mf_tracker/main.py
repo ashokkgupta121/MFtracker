@@ -24,33 +24,29 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 # ── Data store ────────────────────────────────────────────────────────────────
-MF_DIR = Path.home() / ".mf_tracker"
-MF_DIR.mkdir(parents=True, exist_ok=True)
+MF_DIR    = Path.home() / ".mf_tracker"
 META_FILE = MF_DIR / "meta.json"
+MF_DIR.mkdir(parents=True, exist_ok=True)
 
 AUTO_REFRESH_HOURS = 8
 
 
-def _profile_file(profile_name: str) -> Path:
-    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in profile_name)
+def _profile_file(name: str) -> Path:
+    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name)
     return MF_DIR / f"portfolio_{safe}.json"
 
 
 def list_profiles() -> list:
-    meta = load_meta()
-    profiles = meta.get("profiles", ["Default"])
-    if not profiles:
-        profiles = ["Default"]
-    return profiles
+    profiles = load_meta().get("profiles", ["Default"])
+    return profiles if profiles else ["Default"]
 
 
 def load_portfolio(profile: str) -> list:
     f = _profile_file(profile)
-    # Migrate legacy single-portfolio file on first run
+    # One-time migration from single-file v7 format
     legacy = MF_DIR / "portfolio.json"
     if legacy.exists() and not f.exists() and profile == "Default":
-        import shutil
-        shutil.copy(legacy, f)
+        import shutil; shutil.copy(legacy, f)
     if f.exists():
         with open(f) as fh:
             return json.load(fh)
@@ -71,16 +67,14 @@ def add_profile(name: str):
     save_meta(meta)
 
 
-def remove_profile(name: str):
+def remove_portfolio_profile(name: str):
     meta = load_meta()
     profiles = meta.get("profiles", ["Default"])
     if name in profiles and name != "Default":
         profiles.remove(name)
     meta["profiles"] = profiles
-    # Remove last_refreshed for this profile
     meta.pop(f"last_refreshed_{name}", None)
     save_meta(meta)
-    # Delete data file
     f = _profile_file(name)
     if f.exists():
         f.unlink()
@@ -99,12 +93,10 @@ def save_meta(meta: dict):
 
 
 def hours_since_last_refresh(profile: str) -> float:
-    meta = load_meta()
-    last = meta.get(f"last_refreshed_{profile}")
+    last = load_meta().get(f"last_refreshed_{profile}")
     if not last:
         return float("inf")
-    delta = datetime.datetime.now() - datetime.datetime.fromisoformat(last)
-    return delta.total_seconds() / 3600
+    return (datetime.datetime.now() - datetime.datetime.fromisoformat(last)).total_seconds() / 3600
 
 
 def touch_last_refreshed(profile: str):
@@ -115,15 +107,31 @@ def touch_last_refreshed(profile: str):
 
 # ── NAV fetching ──────────────────────────────────────────────────────────────
 def fetch_nav_history(scheme_code: str, from_date: str):
-    """Fetch NAV history from MFAPI (free, no key needed)."""
+    """Fetch NAV history from MFAPI."""
+    import threading
+    import requests
+    
+    thread_name = threading.current_thread().name
+    print(f"[{thread_name}] Fetching {scheme_code}...")
+    
     try:
-        import urllib.request
         url = f"https://api.mfapi.in/mf/{scheme_code}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = json.loads(resp.read())
+        headers = {"User-Agent": "Mozilla/5.0"}
+        
+        # requests handles IncompleteRead automatically ✓
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        raw = response.json()
+        print(f"[{thread_name}] ✓ Success")
+        
+        if raw.get("status") == "ERROR" or "data" not in raw:
+            return [], "not_found"
+        
         data = raw.get("data", [])
-        # data is list of {"date":"DD-MM-YYYY","nav":"..."}
+        if not data:
+            return [], "no_data"
+        
         from_dt = datetime.datetime.strptime(from_date, "%Y-%m-%d").date()
         history = []
         for entry in data:
@@ -131,12 +139,19 @@ def fetch_nav_history(scheme_code: str, from_date: str):
                 dt = datetime.datetime.strptime(entry["date"], "%d-%m-%Y").date()
                 if dt >= from_dt:
                     history.append({"date": dt.isoformat(), "nav": float(entry["nav"])})
-            except Exception:
+            except:
                 continue
         history.sort(key=lambda x: x["date"])
-        return history
-    except Exception as e:
-        return []
+        
+        if not history:
+            latest = data[0].get("date", "?")
+            return [], f"date_filter|{latest}"
+        
+        return history, "ok"
+    
+    except requests.exceptions.RequestException as e:
+        print(f"[{thread_name}] ✗ Error: {e}")
+        return [], "network"
 
 
 def search_funds(query: str):
@@ -152,6 +167,47 @@ def search_funds(query: str):
         return results[:20]
     except Exception:
         return []
+
+
+def verify_scheme(scheme_code: str, purchase_date: str):
+    """Quick check — returns (ok, message) before adding a fund."""
+    history, reason = fetch_nav_history(scheme_code, purchase_date)
+    if reason == "ok":
+        latest_nav = history[-1]["nav"]
+        latest_date = history[-1]["date"]
+        return True, f"✓  Found {len(history)} NAV records. Latest: ₹{latest_nav:.2f} on {latest_date}"
+    elif reason == "not_found":
+        return False, f"Scheme code {scheme_code} was not found on MFAPI.\nPlease check the code and try again."
+    elif reason == "no_data":
+        return False, f"Scheme {scheme_code} exists but has no NAV data on MFAPI.\nThis may be a very old or closed fund."
+    elif reason and reason.startswith("date_filter"):
+        latest = reason.split("|")[1] if "|" in reason else "unknown"
+        return False, (f"Scheme {scheme_code} has NAV data but the latest entry is {latest},\n"
+                       f"which is before your purchase date ({purchase_date}).\n\n"
+                       f"Try setting an earlier purchase date, or this may be a wound-up fund.")
+    else:
+        return False, f"Could not reach MFAPI (network error).\nPlease check your internet connection and try again."
+    """Compute XIRR given list of (date_str, amount) – negative=investment, positive=current."""
+    if len(cashflows) < 2:
+        return None
+    dates = [datetime.datetime.strptime(c[0], "%Y-%m-%d") for c in cashflows]
+    amounts = [c[1] for c in cashflows]
+    def npv(rate):
+        t0 = dates[0]
+        return sum(a / ((1 + rate) ** ((d - t0).days / 365.0)) for d, a in zip(dates, amounts))
+    lo, hi = -0.999, 100.0
+    try:
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            if npv(mid) > 0:
+                lo = mid
+            else:
+                hi = mid
+            if abs(hi - lo) < 1e-7:
+                break
+        return round((lo + hi) / 2 * 100, 2)
+    except Exception:
+        return None
 
 
 def xirr(cashflows):
@@ -180,7 +236,7 @@ def xirr(cashflows):
 
 # ── Background worker ─────────────────────────────────────────────────────────
 class NavFetcher(QThread):
-    done = pyqtSignal(str, list)   # scheme_code, history
+    done = pyqtSignal(str, list, str)   # scheme_code, history, reason
 
     def __init__(self, scheme_code, from_date):
         super().__init__()
@@ -188,8 +244,8 @@ class NavFetcher(QThread):
         self.from_date = from_date
 
     def run(self):
-        history = fetch_nav_history(self.scheme_code, self.from_date)
-        self.done.emit(self.scheme_code, history)
+        history, reason = fetch_nav_history(self.scheme_code, self.from_date)
+        self.done.emit(self.scheme_code, history, reason)
 
 
 # ── Add Fund Dialog ───────────────────────────────────────────────────────────
@@ -331,8 +387,8 @@ class AddFundDialog(QDialog):
         )
         name = self.name_input.text().strip() or "Unknown Fund"
         units = self.units_input.value()
-        nav = self.nav_input.value()
-        date = self.date_input.date().toString("yyyy-MM-dd")
+        nav   = self.nav_input.value()
+        date  = self.date_input.date().toString("yyyy-MM-dd")
 
         if not code:
             QMessageBox.warning(self, "Missing", "Please provide a scheme code.")
@@ -341,19 +397,52 @@ class AddFundDialog(QDialog):
             QMessageBox.warning(self, "Invalid", "Units and NAV must be > 0.")
             return
 
-        # Check if purchase date changed — if so, clear nav_history so it gets re-fetched
-        old_date = self.existing_fund.get("purchase_date", "")
+        # In edit mode, only verify if scheme code or date changed
+        skip_verify = (
+            self.edit_mode and
+            code == self.existing_fund.get("scheme_code") and
+            date == self.existing_fund.get("purchase_date") and
+            self.existing_fund.get("nav_history")
+        )
+
+        if not skip_verify:
+            # Show a "Verifying…" indicator while we check
+            self.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            QApplication.processEvents()
+            try:
+                ok, msg = verify_scheme(code, date)
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.setEnabled(True)
+
+            if not ok:
+                reply = QMessageBox.warning(
+                    self, "Fund Verification Failed",
+                    f"{msg}\n\nDo you still want to add this fund?\n"
+                    f"(NAV chart will be empty until data is available)",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    return
+            else:
+                # Show success info briefly
+                QMessageBox.information(self, "Fund Verified", msg)
+
+        # Check if purchase date changed — clear nav_history so it gets re-fetched
+        old_date    = self.existing_fund.get("purchase_date", "")
         nav_history = self.existing_fund.get("nav_history", [])
         if date != old_date:
             nav_history = []
 
         self.result_fund = {
             "scheme_code": code,
-            "name": name,
-            "units": units,
+            "name":         name,
+            "units":        units,
             "purchase_nav": nav,
             "purchase_date": date,
-            "nav_history": nav_history
+            "nav_history":  nav_history
         }
         self.accept()
 
@@ -493,7 +582,7 @@ class NavChart(FigureCanvas):
         self._plot_data = data_series
         self._mode = mode
 
-    def plot(self, fund):
+    def plot(self, fund, years=None):
         self.ax.clear()
         self._style_ax()
         self._clear_crosshair()
@@ -501,6 +590,9 @@ class NavChart(FigureCanvas):
         self.ax.set_ylabel("NAV (₹)", color="#8b949e", fontsize=9)
 
         history = fund.get("nav_history", [])
+        if years is not None:
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=years * 365)).date()
+            history = [h for h in history if datetime.date.fromisoformat(h["date"]) >= cutoff]
         if not history:
             self.ax.text(0.5, 0.5, "No NAV data yet.\nClick 'Refresh NAV' to load.",
                          ha="center", va="center", color="#8b949e", fontsize=11,
@@ -526,7 +618,7 @@ class NavChart(FigureCanvas):
         self._store_and_draw([(dates, navs, fund["name"], color)], "single")
         self.draw()
 
-    def plot_compare(self, funds):
+    def plot_compare(self, funds, years=None):
         self.ax.clear()
         self._style_ax()
         self._clear_crosshair()
@@ -538,6 +630,9 @@ class NavChart(FigureCanvas):
         series = []
         for i, fund in enumerate(funds):
             history = fund.get("nav_history", [])
+            if years is not None:
+                cutoff = (datetime.datetime.now() - datetime.timedelta(days=years * 365)).date()
+                history = [h for h in history if datetime.date.fromisoformat(h["date"]) >= cutoff]
             if not history:
                 continue
             color = COMPARE_COLORS[i % len(COMPARE_COLORS)]
@@ -577,7 +672,6 @@ class MFTracker(QMainWindow):
         super().__init__()
         self.setWindowTitle("📈  Mutual Fund Portfolio Tracker")
         self.setMinimumSize(1150, 700)
-        # Ensure Default profile exists
         meta = load_meta()
         if "profiles" not in meta:
             meta["profiles"] = ["Default"]
@@ -637,7 +731,6 @@ class MFTracker(QMainWindow):
         if name == self.current_profile or not name:
             return
         self.current_profile = name
-        # Remember last active profile
         meta = load_meta()
         meta["last_active_profile"] = name
         save_meta(meta)
@@ -647,8 +740,7 @@ class MFTracker(QMainWindow):
         self.chart.ax.clear()
         self.chart._plot_data = []
         self.chart.draw()
-        self._set_status(f"Switched to profile: {name}")
-        QTimer.singleShot(800, self._auto_refresh_if_stale)
+        self._set_status(f"Switched to: {name}")
 
     def _add_profile(self):
         dlg = QDialog(self)
@@ -658,20 +750,20 @@ class MFTracker(QMainWindow):
         layout = QVBoxLayout(dlg)
         layout.setSpacing(12)
         layout.addWidget(QLabel("Profile name (e.g. Spouse, Parent, Child):"))
-        name_input = QLineEdit()
-        name_input.setPlaceholderText("Enter name…")
-        name_input.setMinimumHeight(34)
-        layout.addWidget(name_input)
+        inp = QLineEdit()
+        inp.setPlaceholderText("Enter name…")
+        inp.setMinimumHeight(34)
+        layout.addWidget(inp)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
         if dlg.exec_() == QDialog.Accepted:
-            name = name_input.text().strip()
+            name = inp.text().strip()
             if not name:
                 return
             if name in list_profiles():
-                QMessageBox.warning(self, "Exists", f"Profile '{name}' already exists.")
+                QMessageBox.warning(self, "Exists", f"'{name}' already exists.")
                 return
             add_profile(name)
             self.current_profile = name
@@ -692,30 +784,28 @@ class MFTracker(QMainWindow):
         layout = QVBoxLayout(dlg)
         layout.setSpacing(12)
         layout.addWidget(QLabel(f"Rename '{old}' to:"))
-        name_input = QLineEdit(old)
-        name_input.setMinimumHeight(34)
-        layout.addWidget(name_input)
+        inp = QLineEdit(old)
+        inp.setMinimumHeight(34)
+        layout.addWidget(inp)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
         if dlg.exec_() == QDialog.Accepted:
-            new = name_input.text().strip()
+            new = inp.text().strip()
             if not new or new == old:
                 return
             if new in list_profiles():
-                QMessageBox.warning(self, "Exists", f"Profile '{new}' already exists.")
+                QMessageBox.warning(self, "Exists", f"'{new}' already exists.")
                 return
-            # Rename = add new, copy data, remove old
             data = load_portfolio(old)
             add_profile(new)
             save_portfolio(data, new)
-            # Copy refresh timestamp
             meta = load_meta()
             meta[f"last_refreshed_{new}"] = meta.pop(f"last_refreshed_{old}", None)
             meta["last_active_profile"] = new
             save_meta(meta)
-            remove_profile(old)
+            remove_portfolio_profile(old)
             self.current_profile = new
             self.portfolio = data
             self._repopulate_profile_combo()
@@ -724,25 +814,122 @@ class MFTracker(QMainWindow):
 
     def _delete_profile(self):
         name = self.current_profile
-        if name == "Default" and len(list_profiles()) == 1:
+        if len(list_profiles()) == 1:
             QMessageBox.warning(self, "Cannot Delete", "You must have at least one profile.")
             return
-        reply = QMessageBox.question(
-            self, "Delete Profile",
-            f"Delete profile '{name}' and all its fund data?\nThis cannot be undone.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            remove_profile(name)
-            profiles = list_profiles()
-            self.current_profile = profiles[0]
+        if QMessageBox.question(self, "Delete Profile",
+                                f"Delete '{name}' and all its fund data?\nThis cannot be undone.",
+                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            remove_portfolio_profile(name)
+            self.current_profile = list_profiles()[0]
             self.portfolio = load_portfolio(self.current_profile)
             meta = load_meta()
             meta["last_active_profile"] = self.current_profile
             save_meta(meta)
             self._repopulate_profile_combo()
             self._refresh_table()
-            self._set_status(f"Deleted profile '{name}'")
+            self._set_status(f"Deleted '{name}'")
+
+    # ── Card context helpers ──────────────────────────────────────────────────
+    def _compute_fund_stats(self, fund):
+        history     = fund.get("nav_history", [])
+        current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
+        invested    = fund["units"] * fund["purchase_nav"]
+        current_val = fund["units"] * current_nav
+        pl          = current_val - invested
+        pl_pct      = (pl / invested * 100) if invested else 0
+        cf          = [(fund["purchase_date"], -invested),
+                       (datetime.date.today().isoformat(), current_val)]
+        xi          = xirr(cf)
+        return invested, current_val, pl, pl_pct, xi
+
+    def _set_card_label(self, frame, text):
+        lbl = frame.findChild(QLabel)
+        if lbl:
+            lbl.setText(text)
+
+    def _update_cards_for_fund(self, fund):
+        invested, current_val, pl, pl_pct, xi = self._compute_fund_stats(fund)
+        pl_color = "#3fb950" if pl >= 0 else "#f85149"
+        xi_color = "#3fb950" if xi and xi >= 0 else "#f85149"
+        short = fund["name"][:30] + "…" if len(fund["name"]) > 30 else fund["name"]
+        self._set_card_label(self.card_invested, f"Invested · {short}")
+        self._set_card_label(self.card_current,  "Current Value")
+        self._set_card_label(self.card_pl,       "P&L")
+        self._set_card_label(self.card_xirr,     "XIRR")
+        self._update_card(self.lbl_invested, f"₹{invested:,.0f}")
+        self._update_card(self.lbl_current,  f"₹{current_val:,.0f}")
+        self._update_card(self.lbl_pl,       f"₹{pl:+,.0f}  ({pl_pct:+.1f}%)", pl_color)
+        self._update_card(self.lbl_xirr,     f"{xi:.2f}%" if xi is not None else "—", xi_color)
+
+    def _update_cards_portfolio(self):
+        total_inv = total_cur = 0
+        all_cf = []
+        for fund in self.portfolio:
+            inv, cur, _, _, _ = self._compute_fund_stats(fund)
+            total_inv += inv
+            total_cur += cur
+            all_cf.append([(fund["purchase_date"], -inv),
+                           (datetime.date.today().isoformat(), cur)])
+        total_pl = total_cur - total_inv
+        pl_color = "#3fb950" if total_pl >= 0 else "#f85149"
+        merged   = sorted([i for cf in all_cf for i in cf], key=lambda x: x[0])
+        xi_port  = xirr(merged) if merged else None
+        xi_color = "#3fb950" if xi_port and xi_port >= 0 else "#f85149"
+        self._set_card_label(self.card_invested, "Total Invested")
+        self._set_card_label(self.card_current,  "Current Value")
+        self._set_card_label(self.card_pl,       "P&L")
+        self._set_card_label(self.card_xirr,     "Portfolio XIRR")
+        self._update_card(self.lbl_invested, f"₹{total_inv:,.0f}")
+        self._update_card(self.lbl_current,  f"₹{total_cur:,.0f}")
+        self._update_card(self.lbl_pl,       f"₹{total_pl:+,.0f}", pl_color)
+        self._update_card(self.lbl_xirr,     f"{xi_port:.2f}%" if xi_port is not None else "—", xi_color)
+
+    # ── Sort helpers ──────────────────────────────────────────────────────────
+    def _apply_sort(self, funds):
+        col = self._sort_col
+        if col is None:
+            return list(funds)
+        def sort_key(fund):
+            history     = fund.get("nav_history", [])
+            current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
+            invested    = fund["units"] * fund["purchase_nav"]
+            current_val = fund["units"] * current_nav
+            pl          = current_val - invested
+            pl_pct      = (pl / invested * 100) if invested else 0
+            xi          = xirr([(fund["purchase_date"], -invested),
+                                 (datetime.date.today().isoformat(), current_val)]) or 0
+            return [fund["name"].lower(), fund["scheme_code"], fund["units"],
+                    fund["purchase_nav"], fund["purchase_date"], current_nav,
+                    invested, current_val, pl, pl_pct, xi][col]
+        return sorted(funds, key=sort_key, reverse=not self._sort_asc)
+
+    def _update_header_indicators(self):
+        cols = ["Fund Name","Scheme Code","Units","Buy NAV (₹)","Buy Date",
+                "Current NAV (₹)","Invested (₹)","Current (₹)","P&L (₹)","P&L %","XIRR %"]
+        for i, name in enumerate(cols):
+            arrow = (" ▲" if self._sort_asc else " ▼") if i == self._sort_col else ""
+            self.table.horizontalHeaderItem(i).setText(name + arrow)
+
+    def _on_header_clicked(self, col):
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+        self._refresh_table()
+        self.table.clearSelection()
+        self._update_cards_portfolio()
+
+    def _on_table_selection_changed(self):
+        rows = self.table.selectionModel().selectedRows()
+        if rows:
+            sorted_funds = self._apply_sort(self.portfolio)
+            idx = rows[0].row()
+            if 0 <= idx < len(sorted_funds):
+                self._update_cards_for_fund(sorted_funds[idx])
+        else:
+            self._update_cards_portfolio()
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -758,7 +945,6 @@ class MFTracker(QMainWindow):
         title.setFont(QFont("Segoe UI", 17, QFont.Bold))
         title.setStyleSheet("color: #58a6ff;")
 
-        # Profile controls
         profile_lbl = QLabel("👤  Profile:")
         profile_lbl.setStyleSheet("color: #8b949e; font-size: 12px;")
         self.profile_combo = QComboBox()
@@ -852,17 +1038,17 @@ class MFTracker(QMainWindow):
         self.table.setStyleSheet(self.table.styleSheet() +
             "QTableWidget { alternate-background-color: #161b22; }")
         self.table.verticalHeader().setVisible(False)
-        self.table.setSortingEnabled(False)   # disable Qt built-in sort — we handle it manually
+        self.table.setSortingEnabled(False)
         self.table.doubleClicked.connect(lambda: self._edit_fund())
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
-        # Sorting — use sectionPressed which fires reliably regardless of setSortingEnabled
+        # Sorting
         self._sort_col = None
         self._sort_asc = True
         hdr = self.table.horizontalHeader()
         hdr.setSectionsClickable(True)
         hdr.sectionClicked.connect(self._on_header_clicked)
         hdr.setStyleSheet(
-            "QHeaderView::section { background: #161b22; color: #8b949e; padding: 8px; "
+            "QHeaderView::section { background: #161b22; color: #8b949e; padding: 8px;"
             "border: none; border-bottom: 1px solid #30363d; font-weight: bold; font-size: 12px; }"
             "QHeaderView::section:hover { background: #21262d; color: #e6edf3; }"
         )
@@ -892,6 +1078,20 @@ class MFTracker(QMainWindow):
         self.btn_compare.setFixedWidth(110)
         self.btn_compare.clicked.connect(self._switch_to_compare)
 
+        # Time range toggle
+        self._chart_years = None   # None = all time, 2 = last 2 years
+        self.btn_all_time = QPushButton("All Time")
+        self.btn_all_time.setObjectName("primary")
+        self.btn_all_time.setCheckable(True)
+        self.btn_all_time.setChecked(True)
+        self.btn_all_time.setFixedWidth(82)
+        self.btn_all_time.clicked.connect(self._switch_to_all_time)
+
+        self.btn_2yr = QPushButton("Last 2 Yrs")
+        self.btn_2yr.setCheckable(True)
+        self.btn_2yr.setFixedWidth(90)
+        self.btn_2yr.clicked.connect(self._switch_to_2yr)
+
         self.fund_selector = QComboBox()
         self.fund_selector.setMinimumWidth(300)
         self.fund_selector.currentIndexChanged.connect(self._plot_selected)
@@ -902,6 +1102,9 @@ class MFTracker(QMainWindow):
 
         chart_ctrl.addWidget(self.btn_single)
         chart_ctrl.addWidget(self.btn_compare)
+        chart_ctrl.addSpacing(16)
+        chart_ctrl.addWidget(self.btn_all_time)
+        chart_ctrl.addWidget(self.btn_2yr)
         chart_ctrl.addSpacing(12)
         chart_ctrl.addWidget(self.fund_selector)
         chart_ctrl.addWidget(self.compare_hint)
@@ -1037,6 +1240,8 @@ scheme_code,name,units,purchase_nav,purchase_date
                 except Exception as e:
                     errors.append(f"Row {i}: {e}")
         save_portfolio(self.portfolio, self.current_profile)
+        self._refresh_table()
+        msg = f"Imported {count} fund(s)."
         if errors:
             msg += f"\n\nErrors:\n" + "\n".join(errors)
         QMessageBox.information(self, "Import Complete", msg)
@@ -1080,7 +1285,6 @@ scheme_code,name,units,purchase_nav,purchase_date
         if not silent:
             self._set_status("Fetching NAV data…", duration=0)
         self._pending = len(self.portfolio)
-        self._refresh_profile = self.current_profile   # snapshot profile at refresh start
         for fund in self.portfolio:
             worker = NavFetcher(fund["scheme_code"], fund["purchase_date"])
             worker.done.connect(self._on_nav_fetched)
@@ -1088,89 +1292,58 @@ scheme_code,name,units,purchase_nav,purchase_date
             self._workers = getattr(self, "_workers", [])
             self._workers.append(worker)
 
-    def _on_nav_fetched(self, code, history):
+    def _on_nav_fetched(self, code, history, reason):
+        fund_name = next((f["name"] for f in self.portfolio if f["scheme_code"] == code), code)
         for fund in self.portfolio:
             if fund["scheme_code"] == code:
                 if history:
                     fund["nav_history"] = history
+                else:
+                    # Track failed funds for summary report
+                    self._nav_failures = getattr(self, "_nav_failures", [])
+                    self._nav_failures.append((fund_name, code, reason))
+
         self._pending = getattr(self, "_pending", 1) - 1
         if self._pending <= 0:
             save_portfolio(self.portfolio, self.current_profile)
             touch_last_refreshed(self.current_profile)
             self._refresh_table()
-            self._set_status("NAV data updated ✓")
+
+            # Show failure summary if any funds had issues
+            failures = getattr(self, "_nav_failures", [])
+            self._nav_failures = []   # reset for next refresh
+            if failures:
+                lines = []
+                for fname, fcode, r in failures:
+                    if r == "not_found":
+                        reason_txt = "Scheme code not found on MFAPI"
+                    elif r == "no_data":
+                        reason_txt = "No NAV data available (closed/old fund)"
+                    elif r and r.startswith("date_filter"):
+                        latest = r.split("|")[1] if "|" in r else "unknown date"
+                        reason_txt = f"All NAV data predates purchase date (latest on MFAPI: {latest})"
+                    elif r == "network":
+                        reason_txt = "Network error — could not reach MFAPI"
+                    else:
+                        reason_txt = "Unknown error"
+                    lines.append(f"• {fname} ({fcode})\n  → {reason_txt}")
+
+                ok_count = len(self.portfolio) - len(failures)
+                msg = (f"NAV updated for {ok_count} fund(s).\n\n"
+                       f"⚠️  {len(failures)} fund(s) could not be updated:\n\n" +
+                       "\n\n".join(lines))
+                QMessageBox.warning(self, "NAV Refresh — Partial Results", msg)
+                self._set_status(f"NAV updated — {len(failures)} fund(s) had issues ⚠️")
+            else:
+                self._set_status("NAV data updated ✓")
+
             self._populate_fund_selector()
-
-    # ── Card update helpers ───────────────────────────────────────────────────
-    def _compute_fund_stats(self, fund):
-        """Return (invested, current_val, pl, pl_pct, xi) for a single fund."""
-        history     = fund.get("nav_history", [])
-        current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
-        invested    = fund["units"] * fund["purchase_nav"]
-        current_val = fund["units"] * current_nav
-        pl          = current_val - invested
-        pl_pct      = (pl / invested * 100) if invested else 0
-        cf          = [(fund["purchase_date"], -invested),
-                       (datetime.date.today().isoformat(), current_val)]
-        xi          = xirr(cf)
-        return invested, current_val, pl, pl_pct, xi
-
-    def _update_cards_for_fund(self, fund):
-        """Show metrics for a single selected fund."""
-        invested, current_val, pl, pl_pct, xi = self._compute_fund_stats(fund)
-        pl_color = "#3fb950" if pl >= 0 else "#f85149"
-        xi_color = "#3fb950" if xi and xi >= 0 else "#f85149"
-        # Shorten name for card label
-        short = fund["name"][:30] + "…" if len(fund["name"]) > 30 else fund["name"]
-        self._set_card_label(self.card_invested, f"Invested · {short}")
-        self._set_card_label(self.card_current,  "Current Value")
-        self._set_card_label(self.card_pl,       "P&L")
-        self._set_card_label(self.card_xirr,     "XIRR")
-        self._update_card(self.lbl_invested, f"₹{invested:,.0f}")
-        self._update_card(self.lbl_current,  f"₹{current_val:,.0f}")
-        self._update_card(self.lbl_pl,       f"₹{pl:+,.0f}  ({pl_pct:+.1f}%)", pl_color)
-        self._update_card(self.lbl_xirr,     f"{xi:.2f}%" if xi is not None else "—", xi_color)
-
-    def _update_cards_portfolio(self):
-        """Show aggregated portfolio metrics."""
-        total_inv = total_cur = 0
-        all_cf = []
-        for fund in self.portfolio:
-            inv, cur, _, _, _ = self._compute_fund_stats(fund)
-            total_inv += inv
-            total_cur += cur
-            all_cf.append([(fund["purchase_date"], -inv),
-                            (datetime.date.today().isoformat(), cur)])
-        total_pl    = total_cur - total_inv
-        pl_color    = "#3fb950" if total_pl >= 0 else "#f85149"
-        merged      = sorted([item for cf in all_cf for item in cf], key=lambda x: x[0])
-        xi_port     = xirr(merged) if merged else None
-        xi_color    = "#3fb950" if xi_port and xi_port >= 0 else "#f85149"
-
-        self._set_card_label(self.card_invested, "Total Invested")
-        self._set_card_label(self.card_current,  "Current Value")
-        self._set_card_label(self.card_pl,       "P&L")
-        self._set_card_label(self.card_xirr,     "Portfolio XIRR")
-        self._update_card(self.lbl_invested, f"₹{total_inv:,.0f}")
-        self._update_card(self.lbl_current,  f"₹{total_cur:,.0f}")
-        self._update_card(self.lbl_pl,       f"₹{total_pl:+,.0f}", pl_color)
-        self._update_card(self.lbl_xirr,     f"{xi_port:.2f}%" if xi_port is not None else "—", xi_color)
-
-    def _set_card_label(self, frame, text):
-        """Update the small top label inside a card frame."""
-        lbl = frame.findChild(QLabel)   # first QLabel = the title label
-        if lbl:
-            lbl.setText(text)
 
     # ── Table refresh ─────────────────────────────────────────────────────────
     def _refresh_table(self):
         self.table.setRowCount(0)
-        total_inv = total_cur = 0
-        all_cf = []
 
-        sorted_funds = self._apply_sort(self.portfolio)
-
-        for fund in sorted_funds:
+        for fund in self._apply_sort(self.portfolio):
             row = self.table.rowCount()
             self.table.insertRow(row)
 
@@ -1180,14 +1353,8 @@ scheme_code,name,units,purchase_nav,purchase_date
             current_val = fund["units"] * current_nav
             pl = current_val - invested
             pl_pct = (pl / invested * 100) if invested else 0
-
-            # XIRR
-            cf = [(fund["purchase_date"], -invested),
-                  (datetime.date.today().isoformat(), current_val)]
-            xi = xirr(cf)
-            all_cf.append(cf)
-            total_inv += invested
-            total_cur += current_val
+            xi = xirr([(fund["purchase_date"], -invested),
+                        (datetime.date.today().isoformat(), current_val)])
 
             def cell(txt, align=Qt.AlignRight):
                 item = QTableWidgetItem(str(txt))
@@ -1216,76 +1383,9 @@ scheme_code,name,units,purchase_nav,purchase_date
                 xi_item.setForeground(QColor("#3fb950" if xi >= 0 else "#f85149"))
             self.table.setItem(row, 10, xi_item)
 
-        # Summary cards — always show portfolio totals after a full table refresh
         self._update_header_indicators()
         self._update_cards_portfolio()
         self._populate_fund_selector()
-
-    def _on_header_clicked(self, col):
-        """Toggle sort direction on repeated click of same column."""
-        if self._sort_col == col:
-            self._sort_asc = not self._sort_asc
-        else:
-            self._sort_col = col
-            self._sort_asc = True
-        self._refresh_table()
-        self.table.clearSelection()
-        self._update_cards_portfolio()
-
-    def _apply_sort(self, funds):
-        """Return funds sorted by _sort_col, or original order if no sort active."""
-        col = self._sort_col
-        if col is None:
-            return list(funds)
-
-        def sort_key(fund):
-            history     = fund.get("nav_history", [])
-            current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
-            invested    = fund["units"] * fund["purchase_nav"]
-            current_val = fund["units"] * current_nav
-            pl          = current_val - invested
-            pl_pct      = (pl / invested * 100) if invested else 0
-            cf          = [(fund["purchase_date"], -invested),
-                           (datetime.date.today().isoformat(), current_val)]
-            xi          = xirr(cf) or 0
-            keys = [
-                fund["name"].lower(),          # 0 Fund Name
-                fund["scheme_code"],            # 1 Scheme Code
-                fund["units"],                  # 2 Units
-                fund["purchase_nav"],           # 3 Buy NAV
-                fund["purchase_date"],          # 4 Buy Date
-                current_nav,                    # 5 Current NAV
-                invested,                       # 6 Invested
-                current_val,                    # 7 Current
-                pl,                             # 8 P&L ₹
-                pl_pct,                         # 9 P&L %
-                xi,                             # 10 XIRR %
-            ]
-            return keys[col]
-
-        return sorted(funds, key=sort_key, reverse=not self._sort_asc)
-
-    def _update_header_indicators(self):
-        """Show ▲ / ▼ arrow on the sorted column header."""
-        cols = ["Fund Name", "Scheme Code", "Units", "Buy NAV (₹)",
-                "Buy Date", "Current NAV (₹)", "Invested (₹)", "Current (₹)", "P&L (₹)", "P&L %", "XIRR %"]
-        for i, name in enumerate(cols):
-            if i == self._sort_col:
-                arrow = " ▲" if self._sort_asc else " ▼"
-                self.table.horizontalHeaderItem(i).setText(name + arrow)
-            else:
-                self.table.horizontalHeaderItem(i).setText(name)
-
-    def _on_table_selection_changed(self):
-        rows = self.table.selectionModel().selectedRows()
-        if rows:
-            # Map visual row back to sorted portfolio index
-            idx = rows[0].row()
-            sorted_funds = self._apply_sort(self.portfolio)
-            if 0 <= idx < len(sorted_funds):
-                self._update_cards_for_fund(sorted_funds[idx])
-        else:
-            self._update_cards_portfolio()
 
     def _switch_to_single(self):
         self.btn_single.setObjectName("primary")
@@ -1307,9 +1407,34 @@ scheme_code,name,units,purchase_nav,purchase_date
         self.compare_hint.setVisible(True)
         self.btn_single.setStyleSheet("")
         self.btn_compare.setStyleSheet("")
-        self.chart.plot_compare(self.portfolio)
-        # Compare = all funds → show portfolio totals
+        self.chart.plot_compare(self.portfolio, years=self._chart_years)
         self._update_cards_portfolio()
+
+    def _switch_to_all_time(self):
+        self._chart_years = None
+        self.btn_all_time.setObjectName("primary")
+        self.btn_all_time.setChecked(True)
+        self.btn_2yr.setObjectName("")
+        self.btn_2yr.setChecked(False)
+        self.btn_all_time.setStyleSheet("")
+        self.btn_2yr.setStyleSheet("")
+        self._replot_current()
+
+    def _switch_to_2yr(self):
+        self._chart_years = 2
+        self.btn_2yr.setObjectName("primary")
+        self.btn_2yr.setChecked(True)
+        self.btn_all_time.setObjectName("")
+        self.btn_all_time.setChecked(False)
+        self.btn_all_time.setStyleSheet("")
+        self.btn_2yr.setStyleSheet("")
+        self._replot_current()
+
+    def _replot_current(self):
+        if self.btn_compare.isChecked():
+            self.chart.plot_compare(self.portfolio, years=self._chart_years)
+        else:
+            self._plot_selected(self.fund_selector.currentIndex())
 
     def _populate_fund_selector(self):
         self.fund_selector.blockSignals(True)
@@ -1319,16 +1444,15 @@ scheme_code,name,units,purchase_nav,purchase_date
             self.fund_selector.addItem(fund["name"])
         self.fund_selector.setCurrentIndex(current if current < len(self.portfolio) else 0)
         self.fund_selector.blockSignals(False)
-        # Refresh whichever mode is active
         if self.btn_compare.isChecked():
-            self.chart.plot_compare(self.portfolio)
+            self.chart.plot_compare(self.portfolio, years=self._chart_years)
         else:
             self._plot_selected(self.fund_selector.currentIndex())
 
     def _plot_selected(self, idx):
         if 0 <= idx < len(self.portfolio):
             fund = self.portfolio[idx]
-            self.chart.plot(fund)
+            self.chart.plot(fund, years=self._chart_years)
             self._update_cards_for_fund(fund)
 
     def _set_status(self, msg, duration=5000):
