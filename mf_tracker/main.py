@@ -16,12 +16,14 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QDate, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon
 
+import bisect
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker
 
 # ── Data store ────────────────────────────────────────────────────────────────
 MF_DIR    = Path.home() / ".mf_tracker"
@@ -466,11 +468,20 @@ class NavChart(FigureCanvas):
         self._crosshair_v = None
         self._crosshair_h = None
         self._tooltip_box = None
-        self._mode = "single"          # "single" or "compare"
+        self._mode = "single"          # "single", "compare", or "worth"
         self._plot_data = []           # list of (dates, values, label, color)
+        self._ax2 = None               # secondary y-axis (ratio line)
 
         self.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.mpl_connect("axes_leave_event",    self._on_axes_leave)
+
+    def _clear_twin(self):
+        if self._ax2 is not None:
+            try:
+                self._ax2.remove()
+            except Exception:
+                pass
+            self._ax2 = None
 
     def _style_ax(self):
         self.ax.set_facecolor("#0d1117")
@@ -521,7 +532,10 @@ class NavChart(FigureCanvas):
             self._tooltip_box = None
 
     def _on_mouse_move(self, event):
-        if event.inaxes != self.ax or not self._plot_data:
+        active_axes = {self.ax}
+        if self._ax2 is not None:
+            active_axes.add(self._ax2)
+        if event.inaxes not in active_axes or not self._plot_data:
             self._clear_crosshair()
             self.draw_idle()
             return
@@ -529,24 +543,46 @@ class NavChart(FigureCanvas):
         self._clear_crosshair()
         x_num = event.xdata
 
-        # Build tooltip lines — one per series
-        lines = []
-        snap_y = None
-        for dates, values, label, color in self._plot_data:
-            idx = self._nearest(x_num, dates, values)
+        # Worth mode: build one unified tooltip from all three series
+        if self._mode == "worth" and len(self._plot_data) == 3:
+            worth_dates, worth_vals, _, _ = self._plot_data[0]
+            _, inv_vals,   _, _ = self._plot_data[1]
+            idx = self._nearest(x_num, worth_dates, worth_vals)
             if idx is None:
-                continue
-            d = dates[idx]
-            v = values[idx]
-            if snap_y is None:
-                snap_y = v
-                snap_x = mdates.date2num(d)
-            date_str = d.strftime("%d %b %Y")
-            if self._mode == "single":
-                lines.append(f"{date_str}    ₹{v:.2f}")
-            else:
-                short = label[:22] + "…" if len(label) > 22 else label
-                lines.append(f"{short}: {v:.1f}  ({date_str})")
+                self.draw_idle()
+                return
+            d = worth_dates[idx]
+            w = worth_vals[idx]
+            i = inv_vals[idx]
+            pct = (w - i) / i * 100 if i > 0 else 0.0
+            snap_y  = w
+            snap_x  = mdates.date2num(d)
+            pct_str = f"{pct:+.1f}%"
+            lines = [
+                d.strftime("%d %b %Y"),
+                f"Worth:    ₹{w:,.0f}",
+                f"Invested: ₹{i:,.0f}",
+                f"Return:   {pct_str}",
+            ]
+        else:
+            # Build tooltip lines — one per series
+            lines = []
+            snap_y = None
+            for dates, values, label, _ in self._plot_data:
+                idx = self._nearest(x_num, dates, values)
+                if idx is None:
+                    continue
+                d = dates[idx]
+                v = values[idx]
+                if snap_y is None:
+                    snap_y = v
+                    snap_x = mdates.date2num(d)
+                date_str = d.strftime("%d %b %Y")
+                if self._mode == "single":
+                    lines.append(f"{date_str}    ₹{v:.2f}")
+                else:
+                    short = label[:22] + "…" if len(label) > 22 else label
+                    lines.append(f"{short}: {v:.1f}  ({date_str})")
 
         if not lines or snap_y is None:
             self.draw_idle()
@@ -583,6 +619,7 @@ class NavChart(FigureCanvas):
         self._mode = mode
 
     def plot(self, fund, years=None):
+        self._clear_twin()
         self.ax.clear()
         self._style_ax()
         self._clear_crosshair()
@@ -619,6 +656,7 @@ class NavChart(FigureCanvas):
         self.draw()
 
     def plot_compare(self, funds, years=None):
+        self._clear_twin()
         self.ax.clear()
         self._style_ax()
         self._clear_crosshair()
@@ -663,6 +701,116 @@ class NavChart(FigureCanvas):
                        labelcolor="#e6edf3", fontsize=7.5,
                        loc="upper left", framealpha=0.9)
         self._store_and_draw(series, "compare")
+        self.draw()
+
+    def plot_worth(self, funds, years=None):
+        self._clear_twin()
+        self.ax.clear()
+        self._style_ax()
+        self._clear_crosshair()
+        self._plot_data = []
+        self.ax.set_ylabel("Portfolio Worth (₹)", color="#8b949e", fontsize=9)
+
+        # Build per-fund lookup: sorted dates, navs, units, purchase info
+        fund_data = []
+        all_date_strs = set()
+        for fund in funds:
+            history = fund.get("nav_history", [])
+            if not history:
+                continue
+            sorted_hist = sorted(history, key=lambda h: h["date"])
+            fdates = [datetime.date.fromisoformat(h["date"]) for h in sorted_hist]
+            fnavs  = [h["nav"] for h in sorted_hist]
+            fund_data.append((fdates, fnavs, fund["units"],
+                              fund["purchase_nav"], fund["purchase_date"]))
+            all_date_strs.update(h["date"] for h in sorted_hist)
+
+        if not fund_data:
+            self.ax.text(0.5, 0.5, "No NAV data yet.\nClick 'Refresh NAV' to load.",
+                         ha="center", va="center", color="#8b949e", fontsize=11,
+                         transform=self.ax.transAxes)
+            self.draw()
+            return
+
+        all_dates = sorted(datetime.date.fromisoformat(d) for d in all_date_strs)
+
+        if years is not None:
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=years * 365)).date()
+            all_dates = [d for d in all_dates if d >= cutoff]
+
+        if not all_dates:
+            self.ax.text(0.5, 0.5, "No data in selected time range.",
+                         ha="center", va="center", color="#8b949e", fontsize=11,
+                         transform=self.ax.transAxes)
+            self.draw()
+            return
+
+        # For each date compute total portfolio worth and cumulative invested
+        worths = []
+        invested_over_time = []
+        for d in all_dates:
+            worth = 0.0
+            invested = 0.0
+            for fdates, fnavs, units, purchase_nav, purchase_date_str in fund_data:
+                purchase_date = datetime.date.fromisoformat(purchase_date_str)
+                if d < purchase_date:
+                    continue
+                invested += units * purchase_nav
+                idx = bisect.bisect_right(fdates, d) - 1
+                if idx >= 0:
+                    worth += units * fnavs[idx]
+            worths.append(worth)
+            invested_over_time.append(invested)
+
+        plot_dates = [datetime.datetime(d.year, d.month, d.day) for d in all_dates]
+        color = "#3fb950" if worths[-1] >= invested_over_time[-1] else "#f85149"
+
+        self.ax.fill_between(plot_dates, worths, alpha=0.15, color=color)
+        self.ax.plot(plot_dates, worths, color=color, linewidth=1.8,
+                     label="Portfolio Worth", zorder=3)
+        self.ax.plot(plot_dates, invested_over_time, color="#e3b341", linewidth=1.2,
+                     linestyle="--", label="Invested", zorder=2)
+
+        # Ratio line on secondary y-axis: (worth - invested) / invested * 100
+        ratio_color = "#a371f7"
+        ratio = [(w - i) / i * 100 if i > 0 else 0.0
+                 for w, i in zip(worths, invested_over_time)]
+
+        self._ax2 = self.ax.twinx()
+        self._ax2.set_facecolor("#0d1117")
+        self._ax2.tick_params(axis="y", colors="#a371f7", labelsize=8)
+        for spine in self._ax2.spines.values():
+            spine.set_color("#30363d")
+        self._ax2.set_ylabel("Return %", color="#a371f7", fontsize=9)
+        self._ax2.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:+.0f}%"))
+        self._ax2.plot(plot_dates, ratio, color=ratio_color, linewidth=1.4,
+                       linestyle=":", label="Return %", zorder=4, alpha=0.9)
+        self._ax2.axhline(0, color=ratio_color, linewidth=0.6,
+                          linestyle=":", alpha=0.35, zorder=1)
+
+        def _fmt_inr(v, _):
+            if v >= 1e7:   return f"₹{v/1e7:.1f}Cr"
+            if v >= 1e5:   return f"₹{v/1e5:.1f}L"
+            if v >= 1e3:   return f"₹{v/1e3:.0f}K"
+            return f"₹{v:.0f}"
+
+        self.ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_fmt_inr))
+        self._format_xaxis(plot_dates)
+        self.ax.set_title("Total Portfolio Worth Over Time",
+                          color="#e6edf3", fontsize=10, pad=8)
+
+        # Combined legend from both axes
+        lines1, labels1 = self.ax.get_legend_handles_labels()
+        lines2, labels2 = self._ax2.get_legend_handles_labels()
+        self.ax.legend(lines1 + lines2, labels1 + labels2,
+                       facecolor="#161b22", edgecolor="#30363d",
+                       labelcolor="#e6edf3", fontsize=8)
+        self._store_and_draw([
+            (plot_dates, worths,            "Worth",    color),
+            (plot_dates, invested_over_time, "Invested", "#e3b341"),
+            (plot_dates, ratio,             "Return%",  ratio_color),
+        ], "worth")
         self.draw()
 
 
@@ -1078,19 +1226,14 @@ class MFTracker(QMainWindow):
         self.btn_compare.setFixedWidth(110)
         self.btn_compare.clicked.connect(self._switch_to_compare)
 
-        # Time range toggle
-        self._chart_years = None   # None = all time, 2 = last 2 years
-        self.btn_all_time = QPushButton("All Time")
-        self.btn_all_time.setObjectName("primary")
-        self.btn_all_time.setCheckable(True)
-        self.btn_all_time.setChecked(True)
-        self.btn_all_time.setFixedWidth(82)
-        self.btn_all_time.clicked.connect(self._switch_to_all_time)
-
-        self.btn_2yr = QPushButton("Last 2 Yrs")
-        self.btn_2yr.setCheckable(True)
-        self.btn_2yr.setFixedWidth(90)
-        self.btn_2yr.clicked.connect(self._switch_to_2yr)
+        # Time range dropdown
+        self._chart_years = None   # None = all time
+        self.year_filter = QComboBox()
+        self.year_filter.addItem("All Time", None)
+        for y in range(1, 6):
+            self.year_filter.addItem(f"{y} Year{'s' if y > 1 else ''}", y)
+        self.year_filter.setFixedWidth(110)
+        self.year_filter.currentIndexChanged.connect(self._on_year_filter_changed)
 
         self.fund_selector = QComboBox()
         self.fund_selector.setMinimumWidth(300)
@@ -1103,8 +1246,7 @@ class MFTracker(QMainWindow):
         chart_ctrl.addWidget(self.btn_single)
         chart_ctrl.addWidget(self.btn_compare)
         chart_ctrl.addSpacing(16)
-        chart_ctrl.addWidget(self.btn_all_time)
-        chart_ctrl.addWidget(self.btn_2yr)
+        chart_ctrl.addWidget(self.year_filter)
         chart_ctrl.addSpacing(12)
         chart_ctrl.addWidget(self.fund_selector)
         chart_ctrl.addWidget(self.compare_hint)
@@ -1117,7 +1259,35 @@ class MFTracker(QMainWindow):
         chart_layout.addWidget(self.chart, stretch=1)
         self.tabs.addTab(chart_tab, "📈  NAV Chart")
 
-        # Tab 3 – CSV Format Help
+        # Tab 3 – Portfolio Worth
+        worth_tab = QWidget()
+        worth_tab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        worth_layout = QVBoxLayout(worth_tab)
+        worth_layout.setContentsMargins(8, 8, 8, 8)
+        worth_layout.setSpacing(8)
+
+        worth_ctrl = QHBoxLayout()
+        worth_ctrl.setSpacing(10)
+
+        self._worth_years = None
+        self.worth_year_filter = QComboBox()
+        self.worth_year_filter.addItem("All Time", None)
+        for y in range(1, 6):
+            self.worth_year_filter.addItem(f"{y} Year{'s' if y > 1 else ''}", y)
+        self.worth_year_filter.setFixedWidth(110)
+        self.worth_year_filter.currentIndexChanged.connect(self._on_worth_year_changed)
+
+        worth_ctrl.addWidget(self.worth_year_filter)
+        worth_ctrl.addStretch()
+        worth_layout.addLayout(worth_ctrl, stretch=0)
+
+        self.worth_chart = NavChart()
+        self.worth_chart.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.worth_chart.setMinimumHeight(200)
+        worth_layout.addWidget(self.worth_chart, stretch=1)
+        self.tabs.addTab(worth_tab, "💰  Portfolio Worth")
+
+        # Tab 4 – CSV Format Help
         self.tabs.addTab(self._build_help_tab(), "❓  CSV Format")
 
     # ── Summary Cards ─────────────────────────────────────────────────────────
@@ -1410,25 +1580,16 @@ scheme_code,name,units,purchase_nav,purchase_date
         self.chart.plot_compare(self.portfolio, years=self._chart_years)
         self._update_cards_portfolio()
 
-    def _switch_to_all_time(self):
-        self._chart_years = None
-        self.btn_all_time.setObjectName("primary")
-        self.btn_all_time.setChecked(True)
-        self.btn_2yr.setObjectName("")
-        self.btn_2yr.setChecked(False)
-        self.btn_all_time.setStyleSheet("")
-        self.btn_2yr.setStyleSheet("")
+    def _on_year_filter_changed(self, index):
+        self._chart_years = self.year_filter.itemData(index)
         self._replot_current()
 
-    def _switch_to_2yr(self):
-        self._chart_years = 2
-        self.btn_2yr.setObjectName("primary")
-        self.btn_2yr.setChecked(True)
-        self.btn_all_time.setObjectName("")
-        self.btn_all_time.setChecked(False)
-        self.btn_all_time.setStyleSheet("")
-        self.btn_2yr.setStyleSheet("")
-        self._replot_current()
+    def _on_worth_year_changed(self, index):
+        self._worth_years = self.worth_year_filter.itemData(index)
+        self._plot_worth()
+
+    def _plot_worth(self):
+        self.worth_chart.plot_worth(self.portfolio, years=self._worth_years)
 
     def _replot_current(self):
         if self.btn_compare.isChecked():
@@ -1448,6 +1609,7 @@ scheme_code,name,units,purchase_nav,purchase_date
             self.chart.plot_compare(self.portfolio, years=self._chart_years)
         else:
             self._plot_selected(self.fund_selector.currentIndex())
+        self._plot_worth()
 
     def _plot_selected(self, idx):
         if 0 <= idx < len(self.portfolio):
