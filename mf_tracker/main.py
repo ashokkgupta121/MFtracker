@@ -1604,26 +1604,21 @@ class MFTracker(QMainWindow):
             dates = [h["date"] for h in sorted_hist]
             navs = [h["nav"] for h in sorted_hist]
             
-            # Find NAV for start date (use nearest available)
+            # Find NAV for start date (use nearest available on or after start_date)
             start_nav = None
             for i, d in enumerate(dates):
                 if d >= start_date:
                     start_nav = navs[i]
                     break
-            if start_nav is None and dates:
-                # Use last available if all dates are before start_date
-                start_nav = navs[-1]
             
-            # Find NAV for end date (use nearest available)
+            # Find NAV for end date (use nearest available on or before end_date)
             end_nav = None
             for i in range(len(dates) - 1, -1, -1):
                 if dates[i] <= end_date:
                     end_nav = navs[i]
                     break
-            if end_nav is None and dates:
-                # Use first available if all dates are after end_date
-                end_nav = navs[0]
             
+            # Only include fund if we have valid NAV data within the selected range
             if start_nav is not None and end_nav is not None:
                 units = fund["units"]
                 start_value = units * start_nav
