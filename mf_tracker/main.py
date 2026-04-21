@@ -25,6 +25,19 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker
 
+# ── Custom Table Item for Numeric Sorting ────────────────────────────────────
+class NumericTableWidgetItem(QTableWidgetItem):
+    """Custom QTableWidgetItem that sorts numerically instead of alphabetically."""
+    def __init__(self, text, numeric_value):
+        super().__init__(text)
+        self.numeric_value = numeric_value
+    
+    def __lt__(self, other):
+        """Override less-than comparison for sorting."""
+        if isinstance(other, NumericTableWidgetItem):
+            return self.numeric_value < other.numeric_value
+        return super().__lt__(other)
+
 # ── Data store ────────────────────────────────────────────────────────────────
 MF_DIR    = Path.home() / ".mf_tracker"
 META_FILE = MF_DIR / "meta.json"
@@ -219,6 +232,7 @@ def xirr(cashflows):
     dates = [datetime.datetime.strptime(c[0], "%Y-%m-%d") for c in cashflows]
     amounts = [c[1] for c in cashflows]
     def npv(rate):
+        
         t0 = dates[0]
         return sum(a / ((1 + rate) ** ((d - t0).days / 365.0)) for d, a in zip(dates, amounts))
     lo, hi = -0.999, 100.0
@@ -618,7 +632,11 @@ class NavChart(FigureCanvas):
         self._plot_data = data_series
         self._mode = mode
 
-    def plot(self, fund, years=None):
+    def plot(self, funds, years=None):
+        """Plot single-fund NAV chart. funds is a list of portfolio entries for the same scheme."""
+        if isinstance(funds, dict):
+            funds = [funds]   # backward-compat for any direct callers
+
         self._clear_twin()
         self.ax.clear()
         self._style_ax()
@@ -626,7 +644,9 @@ class NavChart(FigureCanvas):
         self._plot_data = []
         self.ax.set_ylabel("NAV (₹)", color="#8b949e", fontsize=9)
 
-        history = fund.get("nav_history", [])
+        # Use the entry with the most NAV history (earliest purchase date covers the widest range)
+        best = max(funds, key=lambda f: len(f.get("nav_history", [])))
+        history = best.get("nav_history", [])
         if years is not None:
             cutoff = (datetime.datetime.now() - datetime.timedelta(days=years * 365)).date()
             history = [h for h in history if datetime.date.fromisoformat(h["date"]) >= cutoff]
@@ -639,20 +659,55 @@ class NavChart(FigureCanvas):
 
         dates = [datetime.datetime.strptime(h["date"], "%Y-%m-%d") for h in history]
         navs  = [h["nav"] for h in history]
-        purchase_nav = fund["purchase_nav"]
-        current_nav  = navs[-1] if navs else purchase_nav
-        color = "#3fb950" if current_nav >= purchase_nav else "#f85149"
+        current_nav = navs[-1]
+
+        # Weighted-average purchase NAV (for color decision)
+        total_units    = sum(f["units"] for f in funds)
+        avg_buy_nav    = sum(f["units"] * f["purchase_nav"] for f in funds) / total_units
+        color = "#3fb950" if current_nav >= avg_buy_nav else "#f85149"
 
         self.ax.fill_between(dates, navs, alpha=0.15, color=color)
         self.ax.plot(dates, navs, color=color, linewidth=1.8, zorder=3)
-        self.ax.axhline(purchase_nav, color="#e3b341", linewidth=1.2,
-                        linestyle="--", label=f"Buy NAV ₹{purchase_nav:.2f}")
+
+        # --- SIP purchase markers ---
+        SIP_COLORS = ["#e3b341", "#58a6ff", "#bc8cff", "#f78166", "#39d353",
+                      "#79c0ff", "#d2a8ff", "#56d364", "#ff7b72", "#3fb950"]
+        sorted_funds = sorted(funds, key=lambda f: f["purchase_date"])
+        chart_start  = dates[0]
+        chart_end    = dates[-1]
+
+        for i, fund in enumerate(sorted_funds):
+            pd_dt = datetime.datetime.strptime(fund["purchase_date"], "%Y-%m-%d")
+            pnav  = fund["purchase_nav"]
+            c     = SIP_COLORS[i % len(SIP_COLORS)]
+
+            if len(funds) == 1:
+                label = f"Buy NAV ₹{pnav:.2f}"
+            else:
+                label = f"SIP {i+1}  ₹{pnav:.2f}  ({fund['purchase_date']})"
+
+            # Horizontal buy-price line (only within the visible date range)
+            x0 = max(pd_dt, chart_start)
+            self.ax.hlines(pnav, x0, chart_end, colors=c, linewidth=1.0,
+                           linestyle="--", label=label, zorder=2, alpha=0.85)
+
+            # Vertical marker at purchase date (if inside visible range)
+            if chart_start <= pd_dt <= chart_end:
+                self.ax.axvline(pd_dt, color=c, linewidth=0.8,
+                                linestyle=":", alpha=0.55, zorder=2)
+                # Dot on the NAV curve at the purchase date
+                idx_nearest = min(range(len(dates)),
+                                  key=lambda k: abs((dates[k] - pd_dt).days))
+                self.ax.scatter([dates[idx_nearest]], [navs[idx_nearest]],
+                                color=c, s=28, zorder=5)
 
         self._format_xaxis(dates)
-        self.ax.set_title(fund["name"], color="#e6edf3", fontsize=10, pad=8)
+        fund_name = funds[0]["name"]
+        title = fund_name if len(funds) == 1 else f"{fund_name}  ·  {len(funds)} SIP investments"
+        self.ax.set_title(title, color="#e6edf3", fontsize=10, pad=8)
         self.ax.legend(facecolor="#161b22", edgecolor="#30363d",
                        labelcolor="#e6edf3", fontsize=8)
-        self._store_and_draw([(dates, navs, fund["name"], color)], "single")
+        self._store_and_draw([(dates, navs, fund_name, color)], "single")
         self.draw()
 
     def plot_compare(self, funds, years=None):
@@ -1010,6 +1065,32 @@ class MFTracker(QMainWindow):
         self._update_card(self.lbl_pl,       f"₹{pl:+,.0f}  ({pl_pct:+.1f}%)", pl_color)
         self._update_card(self.lbl_xirr,     f"{xi:.2f}%" if xi is not None else "—", xi_color)
 
+    def _update_cards_for_consolidated(self, funds):
+        """Summary cards for a single fund with multiple SIP entries."""
+        total_inv = total_cur = 0
+        all_cf = []
+        for fund in funds:
+            inv, cur, _, _, _ = self._compute_fund_stats(fund)
+            total_inv += inv
+            total_cur += cur
+            all_cf.append([(fund["purchase_date"], -inv),
+                           (datetime.date.today().isoformat(), cur)])
+        total_pl = total_cur - total_inv
+        pl_pct   = (total_pl / total_inv * 100) if total_inv else 0
+        pl_color = "#3fb950" if total_pl >= 0 else "#f85149"
+        merged   = sorted([i for cf in all_cf for i in cf], key=lambda x: x[0])
+        xi       = xirr(merged) if merged else None
+        xi_color = "#3fb950" if xi and xi >= 0 else "#f85149"
+        short = funds[0]["name"][:30] + "…" if len(funds[0]["name"]) > 30 else funds[0]["name"]
+        self._set_card_label(self.card_invested, f"Invested · {short}")
+        self._set_card_label(self.card_current,  "Current Value")
+        self._set_card_label(self.card_pl,        "P&L")
+        self._set_card_label(self.card_xirr,      "XIRR")
+        self._update_card(self.lbl_invested, f"₹{total_inv:,.0f}")
+        self._update_card(self.lbl_current,  f"₹{total_cur:,.0f}")
+        self._update_card(self.lbl_pl,       f"₹{total_pl:+,.0f}  ({pl_pct:+.1f}%)", pl_color)
+        self._update_card(self.lbl_xirr,     f"{xi:.2f}%" if xi is not None else "—", xi_color)
+
     def _update_cards_portfolio(self):
         total_inv = total_cur = 0
         all_cf = []
@@ -1287,31 +1368,351 @@ class MFTracker(QMainWindow):
         worth_layout.addWidget(self.worth_chart, stretch=1)
         self.tabs.addTab(worth_tab, "💰  Portfolio Worth")
 
-        # Tab 4 – CSV Format Help
+        # Tab 4 – Gain/Loss Calculator
+        self.tabs.addTab(self._build_gainloss_tab(), "📊  Gain/Loss")
+
+        # Tab 5 – CSV Format Help
         self.tabs.addTab(self._build_help_tab(), "❓  CSV Format")
 
     # ── Summary Cards ─────────────────────────────────────────────────────────
     def _make_card(self, label, value, color):
+        # Simple horizontal layout: label and value on same line
         frame = QFrame()
         frame.setObjectName("card")
-        frame.setFixedHeight(76)
-        v = QVBoxLayout(frame)
-        v.setContentsMargins(14, 10, 14, 10)
-        lbl = QLabel(label)
-        lbl.setStyleSheet("color: #8b949e; font-size: 11px;")
+        frame.setMinimumHeight(36)
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(12, 6, 12, 6)
+        h.setSpacing(8)
+        
+        lbl = QLabel(f"{label}:")
+        lbl.setStyleSheet("color: #8b949e; font-size: 13px; font-weight: 500;")
+        
         val = QLabel(value)
-        val.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        val.setFont(QFont("Segoe UI", 14, QFont.Bold))
         val.setStyleSheet(f"color: {color};")
-        v.addWidget(lbl)
-        v.addWidget(val)
+        
+        h.addWidget(lbl)
+        h.addWidget(val)
+        h.addStretch()
+        
         # Return both — frame goes into layout, val_label is stored for direct updates
         return frame, val
 
     def _update_card(self, val_label, value, color="#e6edf3"):
         val_label.setText(value)
-        val_label.setStyleSheet(f"color: {color}; font-size: 16px; font-weight: bold;")
+        val_label.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
 
     # ── Help Tab ──────────────────────────────────────────────────────────────
+    def _build_gainloss_tab(self):
+        """Build the Gain/Loss Calculator tab."""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+        
+        # Title
+        title = QLabel("📊  Gain/Loss Calculator")
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title.setStyleSheet("color: #58a6ff;")
+        layout.addWidget(title)
+        
+        # Description
+        desc = QLabel("Calculate portfolio gain/loss between two dates based on NAV values and fund quantities.")
+        desc.setStyleSheet("color: #8b949e; font-size: 12px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+        
+        # Date selection form - horizontal layout
+        form_widget = QWidget()
+        form_widget.setStyleSheet("background: #161b22; border-radius: 8px; padding: 16px;")
+        form_layout = QHBoxLayout(form_widget)
+        form_layout.setSpacing(20)
+        form_layout.setContentsMargins(16, 16, 16, 16)
+        
+        # Start Date section
+        start_container = QWidget()
+        start_layout = QVBoxLayout(start_container)
+        start_layout.setSpacing(6)
+        start_layout.setContentsMargins(0, 0, 0, 0)
+        start_label = QLabel("<b style='color:#e6edf3; font-size: 13px;'>Start Date:</b>")
+        self.gl_start_date = QDateEdit()
+        self.gl_start_date.setCalendarPopup(True)
+        self.gl_start_date.setDisplayFormat("yyyy-MM-dd")
+        self.gl_start_date.setDate(QDate.currentDate().addYears(-1))
+        self.gl_start_date.setMinimumWidth(180)
+        self.gl_start_date.setMinimumHeight(36)
+        self.gl_start_date.setStyleSheet("padding: 8px 12px; font-size: 14px;")
+        start_layout.addWidget(start_label)
+        start_layout.addWidget(self.gl_start_date)
+        
+        # End Date section
+        end_container = QWidget()
+        end_layout = QVBoxLayout(end_container)
+        end_layout.setSpacing(6)
+        end_layout.setContentsMargins(0, 0, 0, 0)
+        end_label = QLabel("<b style='color:#e6edf3; font-size: 13px;'>End Date:</b>")
+        self.gl_end_date = QDateEdit()
+        self.gl_end_date.setCalendarPopup(True)
+        self.gl_end_date.setDisplayFormat("yyyy-MM-dd")
+        self.gl_end_date.setDate(QDate.currentDate())
+        self.gl_end_date.setMinimumWidth(180)
+        self.gl_end_date.setMinimumHeight(36)
+        self.gl_end_date.setStyleSheet("padding: 8px 12px; font-size: 14px;")
+        end_layout.addWidget(end_label)
+        end_layout.addWidget(self.gl_end_date)
+        
+        # Calculate button - aligned to bottom
+        btn_container = QWidget()
+        btn_layout = QVBoxLayout(btn_container)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.addStretch()
+        btn_calculate = QPushButton("🧮  Calculate Gain/Loss")
+        btn_calculate.setObjectName("primary")
+        btn_calculate.setMinimumWidth(200)
+        btn_calculate.setMinimumHeight(36)
+        btn_calculate.setStyleSheet("font-size: 14px; padding: 8px 20px;")
+        btn_calculate.clicked.connect(self._calculate_gainloss)
+        btn_layout.addWidget(btn_calculate)
+        
+        form_layout.addWidget(start_container)
+        form_layout.addWidget(end_container)
+        form_layout.addWidget(btn_container)
+        form_layout.addStretch()
+        
+        layout.addWidget(form_widget)
+        
+        # Results section - expandable
+        results_widget = QWidget()
+        results_widget.setStyleSheet("background: #161b22; border-radius: 8px; padding: 16px;")
+        results_layout = QVBoxLayout(results_widget)
+        results_layout.setSpacing(12)
+        results_layout.setContentsMargins(12, 12, 12, 12)
+        
+        # Summary cards - more compact (removed Results title to save space)
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(10)
+        
+        self.gl_card_start, self.gl_lbl_start = self._make_card("Start Value", "—", "#e6edf3")
+        self.gl_card_end, self.gl_lbl_end = self._make_card("End Value", "—", "#e6edf3")
+        self.gl_card_change, self.gl_lbl_change = self._make_card("Gain/Loss", "—", "#e6edf3")
+        self.gl_card_pct, self.gl_lbl_pct = self._make_card("Change %", "—", "#e6edf3")
+        
+        for c in [self.gl_card_start, self.gl_card_end, self.gl_card_change, self.gl_card_pct]:
+            c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            c.setMinimumHeight(36)
+            cards_layout.addWidget(c)
+        
+        results_layout.addLayout(cards_layout)
+        
+        # Detailed table - expandable to fill remaining space
+        #table_label = QLabel("<b style='color:#e6edf3; font-size: 11px;'>Detailed Breakdown:</b>")
+        #results_layout.addWidget(table_label)
+        
+        self.gl_table = QTableWidget()
+        self.gl_table.setColumnCount(7)
+        self.gl_table.setHorizontalHeaderLabels([
+            "Fund Name", "Units", "Start NAV (₹)", "End NAV (₹)",
+            "Start Value (₹)", "End Value (₹)", "Gain/Loss (₹)"
+        ])
+        
+        # Configure table headers and sorting - make headers very visible
+        header = self.gl_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 7):
+            header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        header.setVisible(True)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(100)
+        header.setDefaultSectionSize(150)
+        
+        # Apply header styling with proper text display
+        self.gl_table.setStyleSheet(
+            self.gl_table.styleSheet() +
+            """
+            QHeaderView::section {
+                background-color: #1f6feb;
+                color: #ffffff;
+                padding: 12px 10px;
+                border: none;
+                border-right: 1px solid #0d1117;
+                border-bottom: 3px solid #58a6ff;
+                font-weight: bold;
+                font-size: 13px;
+                min-height: 40px;
+                max-height: 40px;
+            }
+            QHeaderView::section:hover {
+                background-color: #388bfd;
+            }
+            """
+        )
+        
+        # Enable sorting
+        self.gl_table.setSortingEnabled(True)
+        
+        # Configure table behavior
+        self.gl_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.gl_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.gl_table.setAlternatingRowColors(True)
+        self.gl_table.verticalHeader().setVisible(False)
+        
+        # Table styling
+        self.gl_table.setStyleSheet(
+            "QTableWidget { "
+            "alternate-background-color: #161b22; "
+            "background-color: #0d1117; "
+            "gridline-color: #30363d; "
+            "color: #e6edf3; "
+            "}"
+            "QTableWidget::item { padding: 8px; }"
+            "QTableWidget::item:selected { background-color: #1f6feb; }"
+        )
+        
+        # Remove minimum height constraint and let it expand
+        self.gl_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
+        results_layout.addWidget(self.gl_table, 1)  # stretch factor of 1 to expand
+        layout.addWidget(results_widget, 1)  # stretch factor of 1 to expand
+        
+        return w
+    
+    def _calculate_gainloss(self):
+        """Calculate gain/loss for the selected date range."""
+        if not self.portfolio:
+            QMessageBox.information(self, "Empty Portfolio", "No funds in portfolio to calculate.")
+            return
+        
+        start_date = self.gl_start_date.date().toString("yyyy-MM-dd")
+        end_date = self.gl_end_date.date().toString("yyyy-MM-dd")
+        
+        if start_date >= end_date:
+            QMessageBox.warning(self, "Invalid Range", "End date must be after start date.")
+            return
+        
+        # Calculate for each fund
+        results = []
+        total_start_value = 0.0
+        total_end_value = 0.0
+        
+        for fund in self.portfolio:
+            history = fund.get("nav_history", [])
+            if not history:
+                continue
+            
+            # Sort history by date
+            sorted_hist = sorted(history, key=lambda h: h["date"])
+            dates = [h["date"] for h in sorted_hist]
+            navs = [h["nav"] for h in sorted_hist]
+            
+            # Find NAV for start date (use nearest available)
+            start_nav = None
+            for i, d in enumerate(dates):
+                if d >= start_date:
+                    start_nav = navs[i]
+                    break
+            if start_nav is None and dates:
+                # Use last available if all dates are before start_date
+                start_nav = navs[-1]
+            
+            # Find NAV for end date (use nearest available)
+            end_nav = None
+            for i in range(len(dates) - 1, -1, -1):
+                if dates[i] <= end_date:
+                    end_nav = navs[i]
+                    break
+            if end_nav is None and dates:
+                # Use first available if all dates are after end_date
+                end_nav = navs[0]
+            
+            if start_nav is not None and end_nav is not None:
+                units = fund["units"]
+                start_value = units * start_nav
+                end_value = units * end_nav
+                gain_loss = end_value - start_value
+                
+                results.append({
+                    "name": fund["name"],
+                    "units": units,
+                    "start_nav": start_nav,
+                    "end_nav": end_nav,
+                    "start_value": start_value,
+                    "end_value": end_value,
+                    "gain_loss": gain_loss
+                })
+                
+                total_start_value += start_value
+                total_end_value += end_value
+        
+        if not results:
+            QMessageBox.information(self, "No Data",
+                "No NAV data available for the selected date range.\n"
+                "Please refresh NAV data first.")
+            return
+        
+        # Update summary cards
+        total_gain_loss = total_end_value - total_start_value
+        pct_change = (total_gain_loss / total_start_value * 100) if total_start_value > 0 else 0.0
+        
+        self._update_card(self.gl_lbl_start, f"₹{total_start_value:,.2f}", "#e6edf3")
+        self._update_card(self.gl_lbl_end, f"₹{total_end_value:,.2f}", "#e6edf3")
+        
+        gain_color = "#3fb950" if total_gain_loss >= 0 else "#f85149"
+        self._update_card(self.gl_lbl_change,
+            f"{'₹' if total_gain_loss >= 0 else '-₹'}{abs(total_gain_loss):,.2f}",
+            gain_color)
+        self._update_card(self.gl_lbl_pct,
+            f"{'+' if pct_change >= 0 else ''}{pct_change:.2f}%",
+            gain_color)
+        
+        # Update table with proper alignment and sorting support
+        self.gl_table.setSortingEnabled(False)  # Disable sorting while populating
+        self.gl_table.setRowCount(len(results))
+        
+        for row, r in enumerate(results):
+            # Fund name - left aligned (text sorting)
+            name_item = QTableWidgetItem(r["name"])
+            name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self.gl_table.setItem(row, 0, name_item)
+            
+            # Units - right aligned (numeric sorting)
+            units_item = NumericTableWidgetItem(f"{r['units']:.4f}", r['units'])
+            units_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.gl_table.setItem(row, 1, units_item)
+            
+            # Start NAV - right aligned (numeric sorting)
+            start_nav_item = NumericTableWidgetItem(f"₹{r['start_nav']:.2f}", r['start_nav'])
+            start_nav_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.gl_table.setItem(row, 2, start_nav_item)
+            
+            # End NAV - right aligned (numeric sorting)
+            end_nav_item = NumericTableWidgetItem(f"₹{r['end_nav']:.2f}", r['end_nav'])
+            end_nav_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.gl_table.setItem(row, 3, end_nav_item)
+            
+            # Start Value - right aligned (numeric sorting)
+            start_val_item = NumericTableWidgetItem(f"₹{r['start_value']:,.2f}", r['start_value'])
+            start_val_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.gl_table.setItem(row, 4, start_val_item)
+            
+            # End Value - right aligned (numeric sorting)
+            end_val_item = NumericTableWidgetItem(f"₹{r['end_value']:,.2f}", r['end_value'])
+            end_val_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.gl_table.setItem(row, 5, end_val_item)
+            
+            # Gain/Loss - right aligned with color (numeric sorting)
+            gl_item = NumericTableWidgetItem(
+                f"{'₹' if r['gain_loss'] >= 0 else '-₹'}{abs(r['gain_loss']):,.2f}",
+                r['gain_loss']
+            )
+            gl_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            gl_color = "#3fb950" if r['gain_loss'] >= 0 else "#f85149"
+            gl_item.setForeground(QColor(gl_color))
+            self.gl_table.setItem(row, 6, gl_item)
+        
+        self.gl_table.setSortingEnabled(True)  # Re-enable sorting after populating
+        
+        self._set_status(f"Gain/Loss calculated for {len(results)} fund(s) ✓")
+
     def _build_help_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -1354,13 +1755,25 @@ scheme_code,name,units,purchase_nav,purchase_date
         if not rows:
             QMessageBox.information(self, "Select", "Select a row to edit.")
             return
-        idx = rows[0].row()
-        existing = self.portfolio[idx]
+        table_row = rows[0].row()
+        # Get the sorted funds to map table row back to portfolio index
+        sorted_funds = self._apply_sort(self.portfolio)
+        selected_fund = sorted_funds[table_row]
+        # Find the index of this fund in the original portfolio
+        portfolio_idx = None
+        for i, fund in enumerate(self.portfolio):
+            if fund is selected_fund:
+                portfolio_idx = i
+                break
+        if portfolio_idx is None:
+            QMessageBox.warning(self, "Error", "Could not find selected fund in portfolio.")
+            return
+        existing = self.portfolio[portfolio_idx]
         dlg = AddFundDialog(self, fund=existing)
         if dlg.exec_() == QDialog.Accepted:
             updated = dlg.result_fund
             refetch = len(updated["nav_history"]) == 0 and existing.get("nav_history")
-            self.portfolio[idx] = updated
+            self.portfolio[portfolio_idx] = updated
             save_portfolio(self.portfolio, self.current_profile)
             self._refresh_table()
             self._set_status(f"Updated: {updated['name']}")
@@ -1378,11 +1791,23 @@ scheme_code,name,units,purchase_nav,purchase_date
         if not rows:
             QMessageBox.information(self, "Select", "Select a row to remove.")
             return
-        idx = rows[0].row()
-        name = self.portfolio[idx]["name"]
+        table_row = rows[0].row()
+        # Get the sorted funds to map table row back to portfolio index
+        sorted_funds = self._apply_sort(self.portfolio)
+        selected_fund = sorted_funds[table_row]
+        # Find the index of this fund in the original portfolio
+        portfolio_idx = None
+        for i, fund in enumerate(self.portfolio):
+            if fund is selected_fund:
+                portfolio_idx = i
+                break
+        if portfolio_idx is None:
+            QMessageBox.warning(self, "Error", "Could not find selected fund in portfolio.")
+            return
+        name = self.portfolio[portfolio_idx]["name"]
         if QMessageBox.question(self, "Remove", f"Remove {name}?",
                                 QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self.portfolio.pop(idx)
+            self.portfolio.pop(portfolio_idx)
             save_portfolio(self.portfolio, self.current_profile)
             self._refresh_table()
             self._set_status(f"Removed: {name}")
@@ -1454,9 +1879,19 @@ scheme_code,name,units,purchase_nav,purchase_date
             return
         if not silent:
             self._set_status("Fetching NAV data…", duration=0)
-        self._pending = len(self.portfolio)
+
+        # One fetch per unique scheme_code, using the earliest purchase date so the
+        # history covers all SIP entries of the same fund.
+        unique: dict = {}
         for fund in self.portfolio:
-            worker = NavFetcher(fund["scheme_code"], fund["purchase_date"])
+            code = fund["scheme_code"]
+            date = fund["purchase_date"]
+            if code not in unique or date < unique[code]:
+                unique[code] = date
+
+        self._pending = len(unique)
+        for code, from_date in unique.items():
+            worker = NavFetcher(code, from_date)
             worker.done.connect(self._on_nav_fetched)
             worker.start()
             self._workers = getattr(self, "_workers", [])
@@ -1464,14 +1899,14 @@ scheme_code,name,units,purchase_nav,purchase_date
 
     def _on_nav_fetched(self, code, history, reason):
         fund_name = next((f["name"] for f in self.portfolio if f["scheme_code"] == code), code)
-        for fund in self.portfolio:
-            if fund["scheme_code"] == code:
-                if history:
-                    fund["nav_history"] = history
-                else:
-                    # Track failed funds for summary report
-                    self._nav_failures = getattr(self, "_nav_failures", [])
-                    self._nav_failures.append((fund_name, code, reason))
+        matched = [f for f in self.portfolio if f["scheme_code"] == code]
+        if history:
+            for fund in matched:
+                fund["nav_history"] = history
+        else:
+            # Track one failure per scheme_code (not once per SIP entry)
+            self._nav_failures = getattr(self, "_nav_failures", [])
+            self._nav_failures.append((fund_name, code, reason))
 
         self._pending = getattr(self, "_pending", 1) - 1
         if self._pending <= 0:
@@ -1599,12 +2034,32 @@ scheme_code,name,units,purchase_nav,purchase_date
 
     def _populate_fund_selector(self):
         self.fund_selector.blockSignals(True)
-        current = self.fund_selector.currentIndex()
+        # Remember current selection by scheme_code so we can restore it
+        prev_code = self.fund_selector.currentData()
         self.fund_selector.clear()
+
+        # One entry per unique scheme_code; label shows SIP count when > 1
+        seen = []
         for fund in self.portfolio:
-            self.fund_selector.addItem(fund["name"])
-        self.fund_selector.setCurrentIndex(current if current < len(self.portfolio) else 0)
+            code = fund["scheme_code"]
+            if code not in seen:
+                seen.append(code)
+        for code in seen:
+            entries = [f for f in self.portfolio if f["scheme_code"] == code]
+            name    = entries[0]["name"]
+            label   = f"{name}  ({len(entries)} SIPs)" if len(entries) > 1 else name
+            self.fund_selector.addItem(label, code)   # store scheme_code as item data
+
+        # Restore previous selection (by code), else default to first item
+        restore_idx = 0
+        if prev_code:
+            for i in range(self.fund_selector.count()):
+                if self.fund_selector.itemData(i) == prev_code:
+                    restore_idx = i
+                    break
+        self.fund_selector.setCurrentIndex(restore_idx)
         self.fund_selector.blockSignals(False)
+
         if self.btn_compare.isChecked():
             self.chart.plot_compare(self.portfolio, years=self._chart_years)
         else:
@@ -1612,10 +2067,19 @@ scheme_code,name,units,purchase_nav,purchase_date
         self._plot_worth()
 
     def _plot_selected(self, idx):
-        if 0 <= idx < len(self.portfolio):
-            fund = self.portfolio[idx]
-            self.chart.plot(fund, years=self._chart_years)
-            self._update_cards_for_fund(fund)
+        if idx < 0 or self.fund_selector.count() == 0:
+            return
+        code = self.fund_selector.itemData(idx)
+        if not code:
+            return
+        entries = [f for f in self.portfolio if f["scheme_code"] == code]
+        if not entries:
+            return
+        self.chart.plot(entries, years=self._chart_years)
+        if len(entries) == 1:
+            self._update_cards_for_fund(entries[0])
+        else:
+            self._update_cards_for_consolidated(entries)
 
     def _set_status(self, msg, duration=5000):
         self.status_lbl.setText(msg)
