@@ -169,6 +169,46 @@ def fetch_nav_history(scheme_code: str, from_date: str):
         return [], "network"
 
 
+def fetch_sensex_history(from_date: str):
+    """Fetch Sensex historical data using yfinance library."""
+    try:
+        import yfinance as yf
+        
+        # Convert from_date to datetime
+        from_dt = datetime.datetime.strptime(from_date, "%Y-%m-%d")
+        to_dt = datetime.datetime.now()
+        
+        # BSE SENSEX symbol on Yahoo Finance
+        ticker = yf.Ticker("^BSESN")
+        
+        # Fetch historical data
+        hist = ticker.history(start=from_dt, end=to_dt)
+        
+        if hist.empty:
+            print("No Sensex data available")
+            return [], "no_data"
+        
+        history = []
+        for date, row in hist.iterrows():
+            try:
+                dt = date.date()
+                close_price = float(row['Close'])
+                history.append({"date": dt.isoformat(), "value": close_price})
+            except:
+                continue
+        
+        history.sort(key=lambda x: x["date"])
+        print(f"Fetched {len(history)} Sensex data points")
+        return history, "ok"
+    
+    except ImportError:
+        print("yfinance library not installed. Install with: pip install yfinance")
+        return [], "missing_library"
+    except Exception as e:
+        print(f"Error fetching Sensex data: {e}")
+        return [], "error"
+
+
 def search_funds(query: str):
     """Search mutual fund schemes by name."""
     try:
@@ -582,7 +622,7 @@ class NavChart(FigureCanvas):
             # Build tooltip lines — one per series
             lines = []
             snap_y = None
-            for dates, values, label, _ in self._plot_data:
+            for i, (dates, values, label, _) in enumerate(self._plot_data):
                 idx = self._nearest(x_num, dates, values)
                 if idx is None:
                     continue
@@ -593,7 +633,13 @@ class NavChart(FigureCanvas):
                     snap_x = mdates.date2num(d)
                 date_str = d.strftime("%d %b %Y")
                 if self._mode == "single":
-                    lines.append(f"{date_str}    ₹{v:.2f}")
+                    # For single mode with Sensex, show both values
+                    if label == "Sensex":
+                        lines.append(f"Sensex: {v:,.2f}")
+                    else:
+                        if i == 0:  # First entry is the fund
+                            lines.insert(0, f"{date_str}")
+                        lines.insert(1, f"NAV: ₹{v:.2f}")
                 else:
                     short = label[:22] + "…" if len(label) > 22 else label
                     lines.append(f"{short}: {v:.1f}  ({date_str})")
@@ -667,7 +713,41 @@ class NavChart(FigureCanvas):
         color = "#3fb950" if current_nav >= avg_buy_nav else "#f85149"
 
         self.ax.fill_between(dates, navs, alpha=0.15, color=color)
-        self.ax.plot(dates, navs, color=color, linewidth=1.8, zorder=3)
+        self.ax.plot(dates, navs, color=color, linewidth=1.8, zorder=3, label=funds[0]["name"])
+
+        # --- Fetch and plot Sensex data ---
+        try:
+            from_date = history[0]["date"]
+            sensex_history, status = fetch_sensex_history(from_date)
+            
+            if status == "ok" and sensex_history:
+                # Filter Sensex data to match the date range
+                sensex_dates = []
+                sensex_values = []
+                
+                for entry in sensex_history:
+                    entry_date = datetime.datetime.strptime(entry["date"], "%Y-%m-%d")
+                    if dates[0] <= entry_date <= dates[-1]:
+                        sensex_dates.append(entry_date)
+                        sensex_values.append(entry["value"])
+                
+                if sensex_dates and sensex_values:
+                    # Create secondary y-axis for Sensex
+                    self._ax2 = self.ax.twinx()
+                    self._ax2.set_ylabel("Sensex", color="#58a6ff", fontsize=9)
+                    self._ax2.tick_params(axis='y', labelcolor="#58a6ff", colors="#58a6ff", labelsize=8)
+                    self._ax2.spines['right'].set_color("#58a6ff")
+                    self._ax2.spines['right'].set_linewidth(1.2)
+                    
+                    # Plot Sensex line
+                    self._ax2.plot(sensex_dates, sensex_values, color="#58a6ff",
+                                   linewidth=1.5, linestyle="-", alpha=0.7,
+                                   label="Sensex", zorder=2)
+                    
+                    # Add Sensex data to plot_data for tooltip
+                    self._plot_data.append((sensex_dates, sensex_values, "Sensex", "#58a6ff"))
+        except Exception as e:
+            print(f"Could not fetch Sensex data: {e}")
 
         # --- SIP purchase markers ---
         SIP_COLORS = ["#e3b341", "#58a6ff", "#bc8cff", "#f78166", "#39d353",
@@ -705,9 +785,21 @@ class NavChart(FigureCanvas):
         fund_name = funds[0]["name"]
         title = fund_name if len(funds) == 1 else f"{fund_name}  ·  {len(funds)} SIP investments"
         self.ax.set_title(title, color="#e6edf3", fontsize=10, pad=8)
-        self.ax.legend(facecolor="#161b22", edgecolor="#30363d",
-                       labelcolor="#e6edf3", fontsize=8)
-        self._store_and_draw([(dates, navs, fund_name, color)], "single")
+        
+        # Combine legends from both axes
+        lines1, labels1 = self.ax.get_legend_handles_labels()
+        if self._ax2 is not None:
+            lines2, labels2 = self._ax2.get_legend_handles_labels()
+            self.ax.legend(lines1 + lines2, labels1 + labels2,
+                          facecolor="#161b22", edgecolor="#30363d",
+                          labelcolor="#e6edf3", fontsize=8, loc='upper left')
+        else:
+            self.ax.legend(facecolor="#161b22", edgecolor="#30363d",
+                          labelcolor="#e6edf3", fontsize=8)
+        
+        # Store plot data - insert fund data at the beginning
+        self._plot_data.insert(0, (dates, navs, fund_name, color))
+        self._mode = "single"
         self.draw()
 
     def plot_compare(self, funds, years=None):
@@ -1509,16 +1601,16 @@ class MFTracker(QMainWindow):
         #results_layout.addWidget(table_label)
         
         self.gl_table = QTableWidget()
-        self.gl_table.setColumnCount(7)
+        self.gl_table.setColumnCount(8)
         self.gl_table.setHorizontalHeaderLabels([
             "Fund Name", "Units", "Start NAV (₹)", "End NAV (₹)",
-            "Start Value (₹)", "End Value (₹)", "Gain/Loss (₹)"
+            "Start Value (₹)", "End Value (₹)", "Gain/Loss (₹)", "% Change"
         ])
         
         # Configure table headers and sorting - make headers very visible
         header = self.gl_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for i in range(1, 7):
+        for i in range(1, 8):
             header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         header.setVisible(True)
         header.setStretchLastSection(False)
@@ -1589,15 +1681,15 @@ class MFTracker(QMainWindow):
             QMessageBox.warning(self, "Invalid Range", "End date must be after start date.")
             return
         
-        # Calculate for each fund
-        results = []
-        total_start_value = 0.0
-        total_end_value = 0.0
+        # Group funds by name and consolidate units
+        fund_groups = {}
         
         for fund in self.portfolio:
             history = fund.get("nav_history", [])
             if not history:
                 continue
+            
+            fund_name = fund["name"]
             
             # Sort history by date
             sorted_hist = sorted(history, key=lambda h: h["date"])
@@ -1620,23 +1712,45 @@ class MFTracker(QMainWindow):
             
             # Only include fund if we have valid NAV data within the selected range
             if start_nav is not None and end_nav is not None:
-                units = fund["units"]
-                start_value = units * start_nav
-                end_value = units * end_nav
-                gain_loss = end_value - start_value
+                if fund_name not in fund_groups:
+                    fund_groups[fund_name] = {
+                        "name": fund_name,
+                        "units": 0.0,
+                        "start_nav": start_nav,
+                        "end_nav": end_nav
+                    }
                 
-                results.append({
-                    "name": fund["name"],
-                    "units": units,
-                    "start_nav": start_nav,
-                    "end_nav": end_nav,
-                    "start_value": start_value,
-                    "end_value": end_value,
-                    "gain_loss": gain_loss
-                })
-                
-                total_start_value += start_value
-                total_end_value += end_value
+                # Accumulate units for the same fund
+                fund_groups[fund_name]["units"] += fund["units"]
+        
+        # Calculate results from grouped funds
+        results = []
+        total_start_value = 0.0
+        total_end_value = 0.0
+        
+        for fund_data in fund_groups.values():
+            units = fund_data["units"]
+            start_nav = fund_data["start_nav"]
+            end_nav = fund_data["end_nav"]
+            
+            start_value = units * start_nav
+            end_value = units * end_nav
+            gain_loss = end_value - start_value
+            pct_change = (gain_loss / start_value * 100) if start_value > 0 else 0.0
+            
+            results.append({
+                "name": fund_data["name"],
+                "units": units,
+                "start_nav": start_nav,
+                "end_nav": end_nav,
+                "start_value": start_value,
+                "end_value": end_value,
+                "gain_loss": gain_loss,
+                "pct_change": pct_change
+            })
+            
+            total_start_value += start_value
+            total_end_value += end_value
         
         if not results:
             QMessageBox.information(self, "No Data",
@@ -1703,6 +1817,16 @@ class MFTracker(QMainWindow):
             gl_color = "#3fb950" if r['gain_loss'] >= 0 else "#f85149"
             gl_item.setForeground(QColor(gl_color))
             self.gl_table.setItem(row, 6, gl_item)
+            
+            # % Change - right aligned with color (numeric sorting)
+            pct_item = NumericTableWidgetItem(
+                f"{'+' if r['pct_change'] >= 0 else ''}{r['pct_change']:.2f}%",
+                r['pct_change']
+            )
+            pct_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            pct_color = "#3fb950" if r['pct_change'] >= 0 else "#f85149"
+            pct_item.setForeground(QColor(pct_color))
+            self.gl_table.setItem(row, 7, pct_item)
         
         self.gl_table.setSortingEnabled(True)  # Re-enable sorting after populating
         
