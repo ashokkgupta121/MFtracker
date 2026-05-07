@@ -597,10 +597,12 @@ class NavChart(FigureCanvas):
         self._clear_crosshair()
         x_num = event.xdata
 
-        # Worth mode: build one unified tooltip from all three series
-        if self._mode == "worth" and len(self._plot_data) == 3:
+        # Worth mode: build one unified tooltip from all four series
+        if self._mode == "worth" and len(self._plot_data) == 4:
             worth_dates, worth_vals, _, _ = self._plot_data[0]
             _, inv_vals,   _, _ = self._plot_data[1]
+            _, ret_vals,   _, _ = self._plot_data[2]  # Absolute returns
+            _, pct_vals,   _, _ = self._plot_data[3]  # Return percentage
             idx = self._nearest(x_num, worth_dates, worth_vals)
             if idx is None:
                 self.draw_idle()
@@ -608,15 +610,20 @@ class NavChart(FigureCanvas):
             d = worth_dates[idx]
             w = worth_vals[idx]
             i = inv_vals[idx]
-            pct = (w - i) / i * 100 if i > 0 else 0.0
+            r = ret_vals[idx]  # Absolute return amount
+            pct = pct_vals[idx]  # Return percentage
             snap_y  = w
             snap_x  = mdates.date2num(d)
+            
+            # Format return with + or - sign and color indicator
+            ret_sign = "+" if r >= 0 else ""
             pct_str = f"{pct:+.1f}%"
             lines = [
                 d.strftime("%d %b %Y"),
-                f"Worth:    ₹{w:,.0f}",
-                f"Invested: ₹{i:,.0f}",
-                f"Return:   {pct_str}",
+                f"Worth:      ₹{w:,.0f}",
+                f"Invested:   ₹{i:,.0f}",
+                f"Returns:    {ret_sign}₹{r:,.0f}",
+                f"Return %:   {pct_str}",
             ]
         else:
             # Build tooltip lines — one per series
@@ -856,7 +863,7 @@ class NavChart(FigureCanvas):
         self._style_ax()
         self._clear_crosshair()
         self._plot_data = []
-        self.ax.set_ylabel("Portfolio Worth (₹)", color="#8b949e", fontsize=9)
+        self.ax.set_ylabel("Amount (₹)", color="#8b949e", fontsize=9)
 
         # Build per-fund lookup: sorted dates, navs, units, purchase info
         fund_data = []
@@ -895,6 +902,7 @@ class NavChart(FigureCanvas):
         # For each date compute total portfolio worth and cumulative invested
         worths = []
         invested_over_time = []
+        absolute_returns = []  # New: Track absolute gains/losses
         for d in all_dates:
             worth = 0.0
             invested = 0.0
@@ -908,15 +916,30 @@ class NavChart(FigureCanvas):
                     worth += units * fnavs[idx]
             worths.append(worth)
             invested_over_time.append(invested)
+            absolute_returns.append(worth - invested)  # Calculate absolute return
 
         plot_dates = [datetime.datetime(d.year, d.month, d.day) for d in all_dates]
-        color = "#3fb950" if worths[-1] >= invested_over_time[-1] else "#f85149"
+        
+        # Color based on final return
+        final_return = absolute_returns[-1]
+        worth_color = "#3fb950" if final_return >= 0 else "#f85149"
+        return_color = "#3fb950" if final_return >= 0 else "#f85149"
 
-        self.ax.fill_between(plot_dates, worths, alpha=0.15, color=color)
-        self.ax.plot(plot_dates, worths, color=color, linewidth=1.8,
-                     label="Portfolio Worth", zorder=3)
-        self.ax.plot(plot_dates, invested_over_time, color="#e3b341", linewidth=1.2,
-                     linestyle="--", label="Invested", zorder=2)
+        # Plot Portfolio Worth with fill
+        self.ax.fill_between(plot_dates, worths, alpha=0.12, color=worth_color)
+        self.ax.plot(plot_dates, worths, color=worth_color, linewidth=2.0,
+                     label="Current Worth", zorder=4)
+        
+        # Plot Invested Amount
+        self.ax.plot(plot_dates, invested_over_time, color="#e3b341", linewidth=1.5,
+                     linestyle="--", label="Total Invested", zorder=3, alpha=0.9)
+        
+        # Plot Absolute Returns (Gains/Losses) - NEW LINE
+        self.ax.plot(plot_dates, absolute_returns, color=return_color, linewidth=1.8,
+                     linestyle="-", label="Absolute Returns (₹)", zorder=5, alpha=0.85)
+        
+        # Add zero line for returns reference
+        self.ax.axhline(0, color="#8b949e", linewidth=0.8, linestyle=":", alpha=0.4, zorder=1)
 
         # Ratio line on secondary y-axis: (worth - invested) / invested * 100
         ratio_color = "#a371f7"
@@ -932,19 +955,19 @@ class NavChart(FigureCanvas):
         self._ax2.yaxis.set_major_formatter(
             matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:+.0f}%"))
         self._ax2.plot(plot_dates, ratio, color=ratio_color, linewidth=1.4,
-                       linestyle=":", label="Return %", zorder=4, alpha=0.9)
+                       linestyle=":", label="Return %", zorder=6, alpha=0.9)
         self._ax2.axhline(0, color=ratio_color, linewidth=0.6,
-                          linestyle=":", alpha=0.35, zorder=1)
+                          linestyle=":", alpha=0.35, zorder=2)
 
         def _fmt_inr(v, _):
-            if v >= 1e7:   return f"₹{v/1e7:.1f}Cr"
-            if v >= 1e5:   return f"₹{v/1e5:.1f}L"
-            if v >= 1e3:   return f"₹{v/1e3:.0f}K"
-            return f"₹{v:.0f}"
+            if abs(v) >= 1e7:   return f"₹{v/1e7:+.1f}Cr" if v != abs(v) else f"₹{v/1e7:.1f}Cr"
+            if abs(v) >= 1e5:   return f"₹{v/1e5:+.1f}L" if v != abs(v) else f"₹{v/1e5:.1f}L"
+            if abs(v) >= 1e3:   return f"₹{v/1e3:+.0f}K" if v != abs(v) else f"₹{v/1e3:.0f}K"
+            return f"₹{v:+.0f}" if v < 0 else f"₹{v:.0f}"
 
         self.ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_fmt_inr))
         self._format_xaxis(plot_dates)
-        self.ax.set_title("Total Portfolio Worth Over Time",
+        self.ax.set_title("Portfolio Performance: Worth, Investment & Returns",
                           color="#e6edf3", fontsize=10, pad=8)
 
         # Combined legend from both axes
@@ -952,11 +975,12 @@ class NavChart(FigureCanvas):
         lines2, labels2 = self._ax2.get_legend_handles_labels()
         self.ax.legend(lines1 + lines2, labels1 + labels2,
                        facecolor="#161b22", edgecolor="#30363d",
-                       labelcolor="#e6edf3", fontsize=8)
+                       labelcolor="#e6edf3", fontsize=8, loc='upper left')
         self._store_and_draw([
-            (plot_dates, worths,            "Worth",    color),
-            (plot_dates, invested_over_time, "Invested", "#e3b341"),
-            (plot_dates, ratio,             "Return%",  ratio_color),
+            (plot_dates, worths,            "Worth",        worth_color),
+            (plot_dates, invested_over_time, "Invested",    "#e3b341"),
+            (plot_dates, absolute_returns,   "Returns(₹)",  return_color),
+            (plot_dates, ratio,             "Return%",      ratio_color),
         ], "worth")
         self.draw()
 
@@ -1184,9 +1208,11 @@ class MFTracker(QMainWindow):
         self._update_card(self.lbl_xirr,     f"{xi:.2f}%" if xi is not None else "—", xi_color)
 
     def _update_cards_portfolio(self):
+        # Only calculate for active funds
+        active_funds = self._get_active_funds()
         total_inv = total_cur = 0
         all_cf = []
-        for fund in self.portfolio:
+        for fund in active_funds:
             inv, cur, _, _, _ = self._compute_fund_stats(fund)
             total_inv += inv
             total_cur += cur
@@ -1197,7 +1223,13 @@ class MFTracker(QMainWindow):
         merged   = sorted([i for cf in all_cf for i in cf], key=lambda x: x[0])
         xi_port  = xirr(merged) if merged else None
         xi_color = "#3fb950" if xi_port and xi_port >= 0 else "#f85149"
-        self._set_card_label(self.card_invested, "Total Invested")
+        
+        # Show count of active vs total funds
+        total_count = len(self.portfolio)
+        active_count = len(active_funds)
+        count_suffix = f" ({active_count}/{total_count})" if active_count < total_count else ""
+        
+        self._set_card_label(self.card_invested, f"Total Invested{count_suffix}")
         self._set_card_label(self.card_current,  "Current Value")
         self._set_card_label(self.card_pl,       "P&L")
         self._set_card_label(self.card_xirr,     "Portfolio XIRR")
@@ -1220,14 +1252,17 @@ class MFTracker(QMainWindow):
             pl_pct      = (pl / invested * 100) if invested else 0
             xi          = xirr([(fund["purchase_date"], -invested),
                                  (datetime.date.today().isoformat(), current_val)]) or 0
-            return [fund["name"].lower(), fund["scheme_code"], fund["units"],
+            is_active   = fund.get("is_active", True)
+            # Return appropriate value based on column
+            values = [fund["name"].lower(), fund["scheme_code"], fund["units"],
                     fund["purchase_nav"], fund["purchase_date"], current_nav,
-                    invested, current_val, pl, pl_pct, xi][col]
+                    invested, current_val, pl, pl_pct, xi, is_active]
+            return values[col] if col < len(values) else ""
         return sorted(funds, key=sort_key, reverse=not self._sort_asc)
 
     def _update_header_indicators(self):
         cols = ["Fund Name","Scheme Code","Units","Buy NAV (₹)","Buy Date",
-                "Current NAV (₹)","Invested (₹)","Current (₹)","P&L (₹)","P&L %","XIRR %"]
+                "Current NAV (₹)","Invested (₹)","Current (₹)","P&L (₹)","P&L %","XIRR %","Status"]
         for i, name in enumerate(cols):
             arrow = (" ▲" if self._sort_asc else " ▼") if i == self._sort_col else ""
             self.table.horizontalHeaderItem(i).setText(name + arrow)
@@ -1349,10 +1384,11 @@ class MFTracker(QMainWindow):
         # Table
         self.table = QTableWidget()
         cols = ["Fund Name", "Scheme Code", "Units", "Buy NAV (₹)",
-                "Buy Date", "Current NAV (₹)", "Invested (₹)", "Current (₹)", "P&L (₹)", "P&L %", "XIRR %"]
+                "Buy Date", "Current NAV (₹)", "Invested (₹)", "Current (₹)", "P&L (₹)", "P&L %", "XIRR %", "Status"]
         self.table.setColumnCount(len(cols))
         self.table.setHorizontalHeaderLabels(cols)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeToContents)  # Status column
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -1670,8 +1706,11 @@ class MFTracker(QMainWindow):
     
     def _calculate_gainloss(self):
         """Calculate gain/loss for the selected date range."""
-        if not self.portfolio:
-            QMessageBox.information(self, "Empty Portfolio", "No funds in portfolio to calculate.")
+        # Only calculate for active funds
+        active_funds = self._get_active_funds()
+        
+        if not active_funds:
+            QMessageBox.information(self, "Empty Portfolio", "No active funds in portfolio to calculate.")
             return
         
         start_date = self.gl_start_date.date().toString("yyyy-MM-dd")
@@ -1684,7 +1723,7 @@ class MFTracker(QMainWindow):
         # Group funds by name and consolidate units
         fund_groups = {}
         
-        for fund in self.portfolio:
+        for fund in active_funds:
             history = fund.get("nav_history", [])
             if not history:
                 continue
@@ -1931,6 +1970,38 @@ scheme_code,name,units,purchase_nav,purchase_date
             self._refresh_table()
             self._set_status(f"Removed: {name}")
 
+    def _toggle_fund_status(self, table_row):
+        """Toggle active/inactive status of a fund"""
+        sorted_funds = self._apply_sort(self.portfolio)
+        if table_row >= len(sorted_funds):
+            return
+        selected_fund = sorted_funds[table_row]
+        
+        # Find the index in the original portfolio
+        portfolio_idx = None
+        for i, fund in enumerate(self.portfolio):
+            if fund is selected_fund:
+                portfolio_idx = i
+                break
+        
+        if portfolio_idx is None:
+            return
+        
+        # Toggle the status
+        current_status = self.portfolio[portfolio_idx].get("is_active", True)
+        self.portfolio[portfolio_idx]["is_active"] = not current_status
+        
+        # Save and refresh
+        save_portfolio(self.portfolio, self.current_profile)
+        self._refresh_table()
+        
+        status_text = "activated" if not current_status else "deactivated"
+        self._set_status(f"{self.portfolio[portfolio_idx]['name']} {status_text}")
+
+    def _get_active_funds(self):
+        """Return only active funds from portfolio"""
+        return [f for f in self.portfolio if f.get("is_active", True)]
+
     def _import_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
         if not path:
@@ -2071,6 +2142,11 @@ scheme_code,name,units,purchase_nav,purchase_date
             row = self.table.rowCount()
             self.table.insertRow(row)
 
+            # Ensure is_active field exists (backward compatibility)
+            if "is_active" not in fund:
+                fund["is_active"] = True
+
+            is_active = fund.get("is_active", True)
             history = fund.get("nav_history", [])
             current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
             invested = fund["units"] * fund["purchase_nav"]
@@ -2083,6 +2159,9 @@ scheme_code,name,units,purchase_nav,purchase_date
             def cell(txt, align=Qt.AlignRight):
                 item = QTableWidgetItem(str(txt))
                 item.setTextAlignment(align | Qt.AlignVCenter)
+                # Gray out inactive funds
+                if not is_active:
+                    item.setForeground(QColor("#6e7681"))
                 return item
 
             self.table.setItem(row, 0, cell(fund["name"], Qt.AlignLeft))
@@ -2095,17 +2174,45 @@ scheme_code,name,units,purchase_nav,purchase_date
             self.table.setItem(row, 7, cell(f"₹{current_val:,.2f}"))
 
             pl_item = cell(f"₹{pl:,.2f}")
-            pl_item.setForeground(QColor("#3fb950" if pl >= 0 else "#f85149"))
+            pl_color = "#3fb950" if pl >= 0 else "#f85149"
+            if not is_active:
+                pl_color = "#6e7681"
+            pl_item.setForeground(QColor(pl_color))
             self.table.setItem(row, 8, pl_item)
 
             pct_item = cell(f"{pl_pct:+.2f}%")
-            pct_item.setForeground(QColor("#3fb950" if pl_pct >= 0 else "#f85149"))
+            pct_color = "#3fb950" if pl_pct >= 0 else "#f85149"
+            if not is_active:
+                pct_color = "#6e7681"
+            pct_item.setForeground(QColor(pct_color))
             self.table.setItem(row, 9, pct_item)
 
             xi_item = cell(f"{xi:.2f}%" if xi is not None else "—")
-            if xi is not None:
+            if xi is not None and is_active:
                 xi_item.setForeground(QColor("#3fb950" if xi >= 0 else "#f85149"))
             self.table.setItem(row, 10, xi_item)
+
+            # Status toggle button
+            status_btn = QPushButton("✓ Active" if is_active else "✕ Inactive")
+            status_btn.setFixedWidth(90)
+            if is_active:
+                status_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #1a472a; color: #3fb950; border: 1px solid #2ea043;
+                        padding: 4px 8px; border-radius: 4px; font-size: 11px;
+                    }
+                    QPushButton:hover { background: #2d5a3d; }
+                """)
+            else:
+                status_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #3d1f1f; color: #f85149; border: 1px solid #da3633;
+                        padding: 4px 8px; border-radius: 4px; font-size: 11px;
+                    }
+                    QPushButton:hover { background: #4d2a2a; }
+                """)
+            status_btn.clicked.connect(lambda checked, r=row: self._toggle_fund_status(r))
+            self.table.setCellWidget(row, 11, status_btn)
 
         self._update_header_indicators()
         self._update_cards_portfolio()
@@ -2143,11 +2250,15 @@ scheme_code,name,units,purchase_nav,purchase_date
         self._plot_worth()
 
     def _plot_worth(self):
-        self.worth_chart.plot_worth(self.portfolio, years=self._worth_years)
+        # Only plot active funds
+        active_funds = self._get_active_funds()
+        self.worth_chart.plot_worth(active_funds, years=self._worth_years)
 
     def _replot_current(self):
+        # Only plot active funds
+        active_funds = self._get_active_funds()
         if self.btn_compare.isChecked():
-            self.chart.plot_compare(self.portfolio, years=self._chart_years)
+            self.chart.plot_compare(active_funds, years=self._chart_years)
         else:
             self._plot_selected(self.fund_selector.currentIndex())
 
@@ -2157,14 +2268,17 @@ scheme_code,name,units,purchase_nav,purchase_date
         prev_code = self.fund_selector.currentData()
         self.fund_selector.clear()
 
+        # Only show active funds in selector
+        active_funds = self._get_active_funds()
+        
         # One entry per unique scheme_code; label shows SIP count when > 1
         seen = []
-        for fund in self.portfolio:
+        for fund in active_funds:
             code = fund["scheme_code"]
             if code not in seen:
                 seen.append(code)
         for code in seen:
-            entries = [f for f in self.portfolio if f["scheme_code"] == code]
+            entries = [f for f in active_funds if f["scheme_code"] == code]
             name    = entries[0]["name"]
             label   = f"{name}  ({len(entries)} SIPs)" if len(entries) > 1 else name
             self.fund_selector.addItem(label, code)   # store scheme_code as item data
