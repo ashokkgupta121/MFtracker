@@ -525,6 +525,7 @@ class NavChart(FigureCanvas):
         self._mode = "single"          # "single", "compare", or "worth"
         self._plot_data = []           # list of (dates, values, label, color)
         self._ax2 = None               # secondary y-axis (ratio line)
+        self._ax3 = None               # tertiary y-axis (sensex line)
 
         self.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.mpl_connect("axes_leave_event",    self._on_axes_leave)
@@ -536,6 +537,12 @@ class NavChart(FigureCanvas):
             except Exception:
                 pass
             self._ax2 = None
+        if self._ax3 is not None:
+            try:
+                self._ax3.remove()
+            except Exception:
+                pass
+            self._ax3 = None
 
     def _style_ax(self):
         self.ax.set_facecolor("#0d1117")
@@ -966,22 +973,72 @@ class NavChart(FigureCanvas):
             return f"₹{v:+.0f}" if v < 0 else f"₹{v:.0f}"
 
         self.ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_fmt_inr))
+
+        # --- Fetch and plot Sensex data on tertiary y-axis ---
+        sensex_plot_data = None
+        try:
+            from_date = all_dates[0].isoformat()
+            sensex_history, status = fetch_sensex_history(from_date)
+            
+            if status == "ok" and sensex_history:
+                # Filter Sensex data to match the date range
+                sensex_dates = []
+                sensex_values = []
+                
+                for entry in sensex_history:
+                    entry_date = datetime.date.fromisoformat(entry["date"])
+                    if all_dates[0] <= entry_date <= all_dates[-1]:
+                        sensex_dates.append(datetime.datetime(entry_date.year, entry_date.month, entry_date.day))
+                        sensex_values.append(entry["value"])
+                
+                if sensex_dates and sensex_values:
+                    # Create tertiary y-axis for Sensex
+                    self._ax3 = self._ax2.twinx()
+                    self._ax3.set_facecolor("#0d1117")
+                    self._ax3.tick_params(axis="y", colors="#ff7b72", labelsize=8)
+                    self._ax3.spines['right'].set_color("#ff7b72")
+                    self._ax3.spines['right'].set_linewidth(1.2)
+                    # Offset the right spine position
+                    self._ax3.spines['right'].set_position(('outward', 60))
+                    self._ax3.set_ylabel("Sensex", color="#ff7b72", fontsize=9)
+                    
+                    # Plot Sensex line
+                    self._ax3.plot(sensex_dates, sensex_values, color="#ff7b72",
+                                   linewidth=1.4, linestyle="-", label="Sensex", zorder=5, alpha=0.8)
+                    
+                    sensex_plot_data = (sensex_dates, sensex_values, "Sensex", "#ff7b72")
+        except Exception as e:
+            print(f"Could not fetch Sensex data for portfolio worth: {e}")
+
         self._format_xaxis(plot_dates)
         self.ax.set_title("Portfolio Performance: Worth, Investment & Returns",
                           color="#e6edf3", fontsize=10, pad=8)
 
-        # Combined legend from both axes
+        # Combined legend from all axes (including sensex if available)
         lines1, labels1 = self.ax.get_legend_handles_labels()
         lines2, labels2 = self._ax2.get_legend_handles_labels()
-        self.ax.legend(lines1 + lines2, labels1 + labels2,
+        legend_lines = lines1 + lines2
+        legend_labels = labels1 + labels2
+        
+        if self._ax3 is not None:
+            lines3, labels3 = self._ax3.get_legend_handles_labels()
+            legend_lines = legend_lines + lines3
+            legend_labels = legend_labels + labels3
+        
+        self.ax.legend(legend_lines, legend_labels,
                        facecolor="#161b22", edgecolor="#30363d",
                        labelcolor="#e6edf3", fontsize=8, loc='upper left')
-        self._store_and_draw([
+        
+        plot_data_list = [
             (plot_dates, worths,            "Worth",        worth_color),
             (plot_dates, invested_over_time, "Invested",    "#e3b341"),
             (plot_dates, absolute_returns,   "Returns(₹)",  return_color),
             (plot_dates, ratio,             "Return%",      ratio_color),
-        ], "worth")
+        ]
+        if sensex_plot_data:
+            plot_data_list.append(sensex_plot_data)
+        
+        self._store_and_draw(plot_data_list, "worth")
         self.draw()
 
 
