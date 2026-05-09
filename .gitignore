@@ -2,4 +2,7 @@
 !mf_tracker/
 mf_tracker/*
 !mf_tracker/main.py
+!mf_tracker/sample_portfolio.csv
+!mf_tracker/readme.md
+!mf_tracker/requirements.txt
 !.gitignore
