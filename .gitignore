@@ -1,0 +1,5 @@
+*
+!mf_tracker/
+mf_tracker/*
+!mf_tracker/main.py
+!.gitignore
