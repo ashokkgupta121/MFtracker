@@ -596,6 +596,8 @@ class NavChart(FigureCanvas):
         active_axes = {self.ax}
         if self._ax2 is not None:
             active_axes.add(self._ax2)
+        if self._ax3 is not None:
+            active_axes.add(self._ax3)
         if event.inaxes not in active_axes or not self._plot_data:
             self._clear_crosshair()
             self.draw_idle()
@@ -603,62 +605,85 @@ class NavChart(FigureCanvas):
 
         self._clear_crosshair()
         x_num = event.xdata
+        lines = []
+        snap_x = None
+        snap_y = None
 
-        # Worth mode: build one unified tooltip from all four series
-        if self._mode == "worth" and len(self._plot_data) == 4:
-            worth_dates, worth_vals, _, _ = self._plot_data[0]
-            _, inv_vals,   _, _ = self._plot_data[1]
-            _, ret_vals,   _, _ = self._plot_data[2]  # Absolute returns
-            _, pct_vals,   _, _ = self._plot_data[3]  # Return percentage
-            idx = self._nearest(x_num, worth_dates, worth_vals)
-            if idx is None:
-                self.draw_idle()
-                return
-            d = worth_dates[idx]
-            w = worth_vals[idx]
-            i = inv_vals[idx]
-            r = ret_vals[idx]  # Absolute return amount
-            pct = pct_vals[idx]  # Return percentage
-            snap_y  = w
-            snap_x  = mdates.date2num(d)
-            
-            # Format return with + or - sign and color indicator
-            ret_sign = "+" if r >= 0 else ""
-            pct_str = f"{pct:+.1f}%"
-            lines = [
-                d.strftime("%d %b %Y"),
-                f"Worth:      ₹{w:,.0f}",
-                f"Invested:   ₹{i:,.0f}",
-                f"Returns:    {ret_sign}₹{r:,.0f}",
-                f"Return %:   {pct_str}",
-            ]
-        else:
-            # Build tooltip lines — one per series
-            lines = []
-            snap_y = None
-            for i, (dates, values, label, _) in enumerate(self._plot_data):
-                idx = self._nearest(x_num, dates, values)
+        # Worth mode: build one unified tooltip from all four series (plus optional sensex)
+        if self._mode == "worth" and len(self._plot_data) >= 4:
+            try:
+                worth_dates, worth_vals, _, _ = self._plot_data[0]
+                _, inv_vals,   _, _ = self._plot_data[1]
+                _, ret_vals,   _, _ = self._plot_data[2]  # Absolute returns
+                _, pct_vals,   _, _ = self._plot_data[3]  # Return percentage
+                idx = self._nearest(x_num, worth_dates, worth_vals)
                 if idx is None:
-                    continue
-                d = dates[idx]
-                v = values[idx]
-                if snap_y is None:
-                    snap_y = v
+                    self.draw_idle()
+                    return
+                d = worth_dates[idx]
+                w = worth_vals[idx]
+                i = inv_vals[idx]
+                r = ret_vals[idx]  # Absolute return amount
+                pct = pct_vals[idx]  # Return percentage
+                snap_y  = w
+                snap_x  = mdates.date2num(d)
+                
+                # Format return with + or - sign and color indicator
+                ret_sign = "+" if r >= 0 else ""
+                pct_str = f"{pct:+.1f}%"
+                lines = [
+                    d.strftime("%d %b %Y"),
+                    f"Worth:      ₹{w:,.0f}",
+                    f"Invested:   ₹{i:,.0f}",
+                    f"Returns:    {ret_sign}₹{r:,.0f}",
+                    f"Return %:   {pct_str}",
+                ]
+            except (IndexError, ValueError, AttributeError, TypeError) as e:
+                print(f"Worth tooltip error: {e}. Mode: {self._mode}, Data items: {len(self._plot_data)}")
+                # Fall through to generic tooltip handling below
+        
+        # If worth mode failed or generic mode, build tooltip lines — one per series
+        if not lines:
+            snap_y = None
+            snap_x = None
+            
+            # For single mode, find nearest on PRIMARY axis (fund NAV at index 0) first
+            if self._mode == "single" and len(self._plot_data) > 0:
+                dates, values, label, _ = self._plot_data[0]
+                idx = self._nearest(x_num, dates, values)
+                if idx is not None:
+                    d = dates[idx]
                     snap_x = mdates.date2num(d)
-                date_str = d.strftime("%d %b %Y")
-                if self._mode == "single":
-                    # For single mode with Sensex, show both values
-                    if label == "Sensex":
-                        lines.append(f"Sensex: {v:,.2f}")
-                    else:
-                        if i == 0:  # First entry is the fund
-                            lines.insert(0, f"{date_str}")
-                        lines.insert(1, f"NAV: ₹{v:.2f}")
-                else:
+                    date_str = d.strftime("%d %b %Y")
+                    lines.append(date_str)
+                    lines.append(f"NAV: ₹{values[idx]:.2f}")
+                    
+                    # Now get values from other series at the SAME date
+                    for i in range(1, len(self._plot_data)):
+                        other_dates, other_values, other_label, _ = self._plot_data[i]
+                        if other_label == "Sensex":
+                            # Find nearest Sensex value to our fixed date
+                            other_idx = self._nearest(snap_x, other_dates, other_values)
+                            if other_idx is not None:
+                                lines.append(f"Sensex: {other_values[other_idx]:,.2f}")
+                    
+                    snap_y = values[idx]  # Use fund NAV for crosshair y-position
+            else:
+                # For compare or other modes, iterate through all series
+                for i, (dates, values, label, _) in enumerate(self._plot_data):
+                    idx = self._nearest(x_num, dates, values)
+                    if idx is None:
+                        continue
+                    d = dates[idx]
+                    v = values[idx]
+                    if snap_y is None:
+                        snap_y = v
+                        snap_x = mdates.date2num(d)
+                    date_str = d.strftime("%d %b %Y")
                     short = label[:22] + "…" if len(label) > 22 else label
                     lines.append(f"{short}: {v:.1f}  ({date_str})")
 
-        if not lines or snap_y is None:
+        if not lines or snap_y is None or snap_x is None:
             self.draw_idle()
             return
 
@@ -930,7 +955,7 @@ class NavChart(FigureCanvas):
         # Color based on final return
         final_return = absolute_returns[-1]
         worth_color = "#3fb950" if final_return >= 0 else "#f85149"
-        return_color = "#3fb950" if final_return >= 0 else "#f85149"
+        return_color = "#79c0ff"  # Blue color for absolute returns (distinct from worth)
 
         # Plot Portfolio Worth with fill
         self.ax.fill_between(plot_dates, worths, alpha=0.12, color=worth_color)
@@ -1556,7 +1581,10 @@ class MFTracker(QMainWindow):
         # Tab 4 – Gain/Loss Calculator
         self.tabs.addTab(self._build_gainloss_tab(), "📊  Gain/Loss")
 
-        # Tab 5 – CSV Format Help
+        # Tab 5 – Gains by Period
+        self.tabs.addTab(self._build_gains_tab(), "💹  Gains")
+
+        # Tab 6 – CSV Format Help
         self.tabs.addTab(self._build_help_tab(), "❓  CSV Format")
 
     # ── Summary Cards ─────────────────────────────────────────────────────────
@@ -1927,6 +1955,219 @@ class MFTracker(QMainWindow):
         self.gl_table.setSortingEnabled(True)  # Re-enable sorting after populating
         
         self._set_status(f"Gain/Loss calculated for {len(results)} fund(s) ✓")
+
+    def _build_gains_tab(self):
+        """Build the Gains by Period tab."""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+        
+        # Title
+        title = QLabel("💹  Gains by Period")
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title.setStyleSheet("color: #58a6ff;")
+        layout.addWidget(title)
+        
+        # Description
+        desc = QLabel("View your portfolio gains for different time periods. Select a period to see the gain at a glance.")
+        desc.setStyleSheet("color: #8b949e; font-size: 12px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+        
+        # Period selection
+        period_widget = QWidget()
+        period_widget.setStyleSheet("background: #161b22; border-radius: 8px; padding: 16px;")
+        period_layout = QHBoxLayout(period_widget)
+        period_layout.setSpacing(12)
+        period_layout.setContentsMargins(16, 16, 16, 16)
+        
+        period_label = QLabel("<b style='color:#e6edf3; font-size: 13px;'>Select Period:</b>")
+        self.gains_period_combo = QComboBox()
+        self.gains_period_combo.addItems([
+            "Last 1 Working Day",
+            "Last 1 Week",
+            "Last 1 Month",
+            "Year to Date"
+        ])
+        self.gains_period_combo.setMinimumWidth(200)
+        self.gains_period_combo.setMinimumHeight(36)
+        self.gains_period_combo.setStyleSheet("padding: 8px 12px; font-size: 14px;")
+        self.gains_period_combo.currentIndexChanged.connect(self._update_gains_display)
+        
+        period_layout.addWidget(period_label)
+        period_layout.addWidget(self.gains_period_combo)
+        period_layout.addStretch()
+        
+        layout.addWidget(period_widget)
+        
+        # Gains display area
+        display_widget = QWidget()
+        display_widget.setStyleSheet("background: #161b22; border-radius: 8px; padding: 20px;")
+        display_layout = QVBoxLayout(display_widget)
+        display_layout.setSpacing(16)
+        display_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Center the content vertically and horizontally
+        display_layout.addStretch()
+        
+        # Gain value label
+        gains_value_container = QWidget()
+        gains_value_layout = QVBoxLayout(gains_value_container)
+        gains_value_layout.setSpacing(8)
+        gains_value_layout.setContentsMargins(0, 0, 0, 0)
+        
+        gains_label = QLabel("Total Gain/Loss")
+        gains_label.setStyleSheet("color: #8b949e; font-size: 14px;")
+        gains_label.setAlignment(Qt.AlignCenter)
+        gains_value_layout.addWidget(gains_label)
+        
+        self.gains_value_display = QLabel("₹ 0.00")
+        self.gains_value_display.setFont(QFont("Segoe UI", 48, QFont.Bold))
+        self.gains_value_display.setStyleSheet("color: #e6edf3;")
+        self.gains_value_display.setAlignment(Qt.AlignCenter)
+        gains_value_layout.addWidget(self.gains_value_display)
+        
+        # Percentage change label
+        self.gains_pct_display = QLabel("0.00%")
+        self.gains_pct_display.setFont(QFont("Segoe UI", 24, QFont.Bold))
+        self.gains_pct_display.setStyleSheet("color: #e6edf3;")
+        self.gains_pct_display.setAlignment(Qt.AlignCenter)
+        gains_value_layout.addWidget(self.gains_pct_display)
+        
+        # Add some spacing
+        gains_value_layout.addSpacing(20)
+        
+        display_layout.addWidget(gains_value_container)
+        display_layout.addStretch()
+        
+        layout.addWidget(display_widget, 1)
+        
+        # Initialize display
+        self._update_gains_display()
+        
+        return w
+    
+    def _update_gains_display(self):
+        """Update the gains display based on selected period."""
+        period_index = self.gains_period_combo.currentIndex()
+        periods = {
+            0: "last_working_day",
+            1: "last_week",
+            2: "last_month",
+            3: "year_to_date"
+        }
+        period_type = periods.get(period_index, "year_to_date")
+        
+        gain_loss, pct_change = self._calculate_gains_for_period(period_type)
+        
+        # Update gain value display
+        gain_color = "#3fb950" if gain_loss >= 0 else "#f85149"
+        gain_text = f"{'₹' if gain_loss >= 0 else '-₹'}{abs(gain_loss):,.2f}"
+        self.gains_value_display.setText(gain_text)
+        self.gains_value_display.setStyleSheet(f"color: {gain_color}; font-size: 48px; font-weight: bold;")
+        
+        # Update percentage display
+        pct_text = f"{'+' if pct_change >= 0 else ''}{pct_change:.2f}%"
+        self.gains_pct_display.setText(pct_text)
+        self.gains_pct_display.setStyleSheet(f"color: {gain_color}; font-size: 24px; font-weight: bold;")
+    
+    def _calculate_gains_for_period(self, period_type):
+        """Calculate gains for a specific period type.
+        Returns: (gain_loss, pct_change)
+        """
+        import datetime
+        
+        active_funds = self._get_active_funds()
+        if not active_funds:
+            return 0.0, 0.0
+        
+        today = datetime.date.today()
+        
+        # Calculate start date based on period type
+        if period_type == "last_working_day":
+            # Get last working day NAV (2 days back since NAV is available only on next working date)
+            start_date = today - datetime.timedelta(days=2)
+            if start_date.weekday() >= 5:  # Saturday is 5, Sunday is 6
+                start_date = today - datetime.timedelta(days=4)  # Go back to Thursday if weekday is Saturday/Sunday
+        elif period_type == "last_week":
+            start_date = today - datetime.timedelta(days=7)
+        elif period_type == "last_month":
+            start_date = today - datetime.timedelta(days=30)
+        elif period_type == "year_to_date":
+            start_date = datetime.date(today.year, 1, 1)
+        else:
+            start_date = today - datetime.timedelta(days=30)
+        
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = today.strftime("%Y-%m-%d")
+        
+        # Group funds by name and consolidate units
+        fund_groups = {}
+        
+        for fund in active_funds:
+            history = fund.get("nav_history", [])
+            if not history:
+                continue
+            
+            fund_name = fund["name"]
+            
+            # Sort history by date
+            sorted_hist = sorted(history, key=lambda h: h["date"])
+            dates = [h["date"] for h in sorted_hist]
+            navs = [h["nav"] for h in sorted_hist]
+            
+            # Find NAV for start date (use nearest available on or after start_date)
+            start_nav = None
+            for i, d in enumerate(dates):
+                if d >= start_date_str:
+                    start_nav = navs[i]
+                    break
+            
+            # Find NAV for end date (use nearest available on or before end_date)
+            end_nav = None
+            for i in range(len(dates) - 1, -1, -1):
+                if dates[i] <= end_date_str:
+                    end_nav = navs[i]
+                    break
+            
+            # Use most recent NAV if it's before end_date
+            if end_nav is None and sorted_hist:
+                end_nav = sorted_hist[-1]["nav"]
+            
+            # Only include fund if we have valid NAV data
+            if start_nav is not None and end_nav is not None:
+                if fund_name not in fund_groups:
+                    fund_groups[fund_name] = {
+                        "name": fund_name,
+                        "units": 0.0,
+                        "start_nav": start_nav,
+                        "end_nav": end_nav
+                    }
+                
+                # Accumulate units for the same fund
+                fund_groups[fund_name]["units"] += fund["units"]
+        
+        # Calculate totals
+        total_start_value = 0.0
+        total_end_value = 0.0
+        
+        for fund_data in fund_groups.values():
+            units = fund_data["units"]
+            start_nav = fund_data["start_nav"]
+            end_nav = fund_data["end_nav"]
+            
+            start_value = units * start_nav
+            end_value = units * end_nav
+            
+            total_start_value += start_value
+            total_end_value += end_value
+        
+        # Calculate gain/loss and percentage
+        total_gain_loss = total_end_value - total_start_value
+        pct_change = (total_gain_loss / total_start_value * 100) if total_start_value > 0 else 0.0
+        
+        return total_gain_loss, pct_change
 
     def _build_help_tab(self):
         w = QWidget()
