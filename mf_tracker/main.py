@@ -978,18 +978,20 @@ class NavChart(FigureCanvas):
         ratio = [(w - i) / i * 100 if i > 0 else 0.0
                  for w, i in zip(worths, invested_over_time)]
 
-        self._ax2 = self.ax.twinx()
-        self._ax2.set_facecolor("#0d1117")
-        self._ax2.tick_params(axis="y", colors="#a371f7", labelsize=8)
-        for spine in self._ax2.spines.values():
-            spine.set_color("#30363d")
-        self._ax2.set_ylabel("Return %", color="#a371f7", fontsize=9)
-        self._ax2.yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:+.0f}%"))
-        self._ax2.plot(plot_dates, ratio, color=ratio_color, linewidth=1.4,
-                       linestyle=":", label="Return %", zorder=6, alpha=0.9)
-        self._ax2.axhline(0, color=ratio_color, linewidth=0.6,
-                          linestyle=":", alpha=0.35, zorder=2)
+        # HIDDEN: Secondary axis with Return% to reduce graph clutter
+        # self._ax2 = self.ax.twinx()
+        # self._ax2.set_facecolor("#0d1117")
+        # self._ax2.tick_params(axis="y", colors="#a371f7", labelsize=8)
+        # for spine in self._ax2.spines.values():
+        #     spine.set_color("#30363d")
+        # self._ax2.set_ylabel("Return %", color="#a371f7", fontsize=9)
+        # self._ax2.yaxis.set_major_formatter(
+        #     matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:+.0f}%"))
+        # self._ax2.plot(plot_dates, ratio, color=ratio_color, linewidth=1.4,
+        #                linestyle=":", label="Return %", zorder=6, alpha=0.9)
+        # self._ax2.axhline(0, color=ratio_color, linewidth=0.6,
+        #                   linestyle=":", alpha=0.35, zorder=2)
+        self._ax2 = None  # No secondary axis
 
         def _fmt_inr(v, _):
             if abs(v) >= 1e7:   return f"₹{v/1e7:+.1f}Cr" if v != abs(v) else f"₹{v/1e7:.1f}Cr"
@@ -1017,7 +1019,8 @@ class NavChart(FigureCanvas):
                         sensex_values.append(entry["value"])
                 
                 if sensex_dates and sensex_values:
-                    # Create tertiary y-axis for Sensex
+                    # Create secondary axis for Sensex (no Return% axis anymore)
+                    self._ax2 = self.ax.twinx()
                     self._ax3 = self._ax2.twinx()
                     self._ax3.set_facecolor("#0d1117")
                     self._ax3.tick_params(axis="y", colors="#ff7b72", labelsize=8)
@@ -1058,7 +1061,7 @@ class NavChart(FigureCanvas):
             (plot_dates, worths,            "Worth",        worth_color),
             (plot_dates, invested_over_time, "Invested",    "#e3b341"),
             (plot_dates, absolute_returns,   "Returns(₹)",  return_color),
-            (plot_dates, ratio,             "Return%",      ratio_color),
+            # (plot_dates, ratio,             "Return%",      ratio_color),  # Hidden to reduce axis overlap
         ]
         if sensex_plot_data:
             plot_data_list.append(sensex_plot_data)
@@ -1232,13 +1235,51 @@ class MFTracker(QMainWindow):
             self._set_status(f"Deleted '{name}'")
 
     # ── Card context helpers ──────────────────────────────────────────────────
+    def _get_nav_on_date(self, nav_history, target_date_str):
+        """
+        Get NAV for a specific date from history.
+        If exact date not found, return the closest earlier date.
+        Returns None if no NAV found before/on that date.
+        """
+        if not nav_history:
+            return None
+        
+        try:
+            target = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
+            
+            # Find NAV on or closest before target date
+            closest_nav = None
+            for entry in reversed(nav_history):  # Search backwards (latest first)
+                entry_date = datetime.datetime.strptime(entry["date"], "%Y-%m-%d").date()
+                if entry_date <= target:
+                    closest_nav = entry["nav"]
+                    break
+            
+            return closest_nav
+        except:
+            return None
+
     def _compute_fund_stats(self, fund):
+        """
+        Compute fund statistics.
+        For XIRR: Use real NAV from history on purchase_date (not manual purchase_nav)
+        This is more accurate for SIPs where you enter average price manually.
+        """
         history     = fund.get("nav_history", [])
         current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
-        invested    = fund["units"] * fund["purchase_nav"]
+        
+        # Get real NAV on purchase date from history (for accurate XIRR in SIPs)
+        nav_on_purchase_date = self._get_nav_on_date(history, fund["purchase_date"])
+        if nav_on_purchase_date is None:
+            nav_on_purchase_date = fund["purchase_nav"]  # Fallback to manual entry
+        
+        # Calculate invested amount using actual NAV on purchase date
+        invested    = fund["units"] * nav_on_purchase_date
         current_val = fund["units"] * current_nav
         pl          = current_val - invested
         pl_pct      = (pl / invested * 100) if invested else 0
+        
+        # XIRR using real NAVs (more accurate for SIPs)
         cf          = [(fund["purchase_date"], -invested),
                        (datetime.date.today().isoformat(), current_val)]
         xi          = xirr(cf)
@@ -2445,14 +2486,12 @@ scheme_code,name,units,purchase_nav,purchase_date
                 fund["is_active"] = True
 
             is_active = fund.get("is_active", True)
+            
+            # Use new improved calculation method (with real NAVs)
+            invested, current_val, pl, pl_pct, xi = self._compute_fund_stats(fund)
+            
             history = fund.get("nav_history", [])
             current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
-            invested = fund["units"] * fund["purchase_nav"]
-            current_val = fund["units"] * current_nav
-            pl = current_val - invested
-            pl_pct = (pl / invested * 100) if invested else 0
-            xi = xirr([(fund["purchase_date"], -invested),
-                        (datetime.date.today().isoformat(), current_val)])
 
             def cell(txt, align=Qt.AlignRight):
                 item = QTableWidgetItem(str(txt))
