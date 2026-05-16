@@ -1,3 +1,10 @@
 PyQt5>=5.15.0
 matplotlib>=3.5.0
 yfinance>=0.2.0
+
+# Vector DB for code retrieval (Copilot Chat integration)
+langchain>=0.1.0
+langchain-community>=0.0.0
+langchain-text-splitters>=0.0.0
+chromadb>=1.4.0
+sentence-transformers>=2.2.0
