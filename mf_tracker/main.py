@@ -1042,16 +1042,20 @@ class NavChart(FigureCanvas):
         self.ax.set_title("Portfolio Performance: Worth, Investment & Returns",
                           color="#e6edf3", fontsize=10, pad=8)
 
-        # Combined legend from all axes (including sensex if available)
+        # Combined legend from available axes
         lines1, labels1 = self.ax.get_legend_handles_labels()
-        lines2, labels2 = self._ax2.get_legend_handles_labels()
-        legend_lines = lines1 + lines2
-        legend_labels = labels1 + labels2
+        legend_lines = list(lines1)
+        legend_labels = list(labels1)
+        
+        if self._ax2 is not None:
+            lines2, labels2 = self._ax2.get_legend_handles_labels()
+            legend_lines += lines2
+            legend_labels += labels2
         
         if self._ax3 is not None:
             lines3, labels3 = self._ax3.get_legend_handles_labels()
-            legend_lines = legend_lines + lines3
-            legend_labels = legend_labels + labels3
+            legend_lines += lines3
+            legend_labels += labels3
         
         self.ax.legend(legend_lines, legend_labels,
                        facecolor="#161b22", edgecolor="#30363d",
@@ -1238,51 +1242,57 @@ class MFTracker(QMainWindow):
     def _get_nav_on_date(self, nav_history, target_date_str):
         """
         Get NAV for a specific date from history.
-        If exact date not found, return the closest earlier date.
-        Returns None if no NAV found before/on that date.
+        Prefer exact date; otherwise return the nearest available NAV date.
         """
         if not nav_history:
             return None
         
         try:
             target = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
+            nearest_nav = None
+            nearest_diff = None
             
-            # Find NAV on or closest before target date
-            closest_nav = None
-            for entry in reversed(nav_history):  # Search backwards (latest first)
+            for entry in nav_history:
                 entry_date = datetime.datetime.strptime(entry["date"], "%Y-%m-%d").date()
-                if entry_date <= target:
-                    closest_nav = entry["nav"]
-                    break
+                diff_days = abs((entry_date - target).days)
+                
+                if nearest_diff is None or diff_days < nearest_diff:
+                    nearest_diff = diff_days
+                    nearest_nav = entry["nav"]
+                elif diff_days == nearest_diff and entry_date > target:
+                    # Prefer next available NAV for weekend/holiday purchase dates
+                    nearest_nav = entry["nav"]
             
-            return closest_nav
+            return nearest_nav
         except:
             return None
+
+    def _get_xirr_invested_amount(self, fund):
+        """Investment basis for XIRR using historical NAV on purchase date when available."""
+        history = fund.get("nav_history", [])
+        nav_on_purchase_date = self._get_nav_on_date(history, fund["purchase_date"])
+        if nav_on_purchase_date is None:
+            nav_on_purchase_date = fund["purchase_nav"]
+        return fund["units"] * nav_on_purchase_date
 
     def _compute_fund_stats(self, fund):
         """
         Compute fund statistics.
-        For XIRR: Use real NAV from history on purchase_date (not manual purchase_nav)
-        This is more accurate for SIPs where you enter average price manually.
+        Displayed invested amount uses entered buy price × units.
+        XIRR uses historical NAV on purchase date when available.
         """
         history     = fund.get("nav_history", [])
         current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
         
-        # Get real NAV on purchase date from history (for accurate XIRR in SIPs)
-        nav_on_purchase_date = self._get_nav_on_date(history, fund["purchase_date"])
-        if nav_on_purchase_date is None:
-            nav_on_purchase_date = fund["purchase_nav"]  # Fallback to manual entry
-        
-        # Calculate invested amount using actual NAV on purchase date
-        invested    = fund["units"] * nav_on_purchase_date
+        invested = fund["units"] * fund["purchase_nav"]
         current_val = fund["units"] * current_nav
-        pl          = current_val - invested
-        pl_pct      = (pl / invested * 100) if invested else 0
+        pl = current_val - invested
+        pl_pct = (pl / invested * 100) if invested else 0
         
-        # XIRR using real NAVs (more accurate for SIPs)
-        cf          = [(fund["purchase_date"], -invested),
-                       (datetime.date.today().isoformat(), current_val)]
-        xi          = xirr(cf)
+        xirr_invested = self._get_xirr_invested_amount(fund)
+        cf = [(fund["purchase_date"], -xirr_invested),
+              (datetime.date.today().isoformat(), current_val)]
+        xi = xirr(cf)
         return invested, current_val, pl, pl_pct, xi
 
     def _set_card_label(self, frame, text):
@@ -1312,22 +1322,29 @@ class MFTracker(QMainWindow):
             inv, cur, _, _, _ = self._compute_fund_stats(fund)
             total_inv += inv
             total_cur += cur
-            all_cf.append([(fund["purchase_date"], -inv),
-                           (datetime.date.today().isoformat(), cur)])
+            # Add XIRR cashflow using historical NAV basis
+            all_cf.append((fund["purchase_date"], -self._get_xirr_invested_amount(fund)))
+        # Add single current value cashflow (positive) for today
+        all_cf.append((datetime.date.today().isoformat(), total_cur))
         total_pl = total_cur - total_inv
         pl_pct   = (total_pl / total_inv * 100) if total_inv else 0
         pl_color = "#3fb950" if total_pl >= 0 else "#f85149"
-        merged   = sorted([i for cf in all_cf for i in cf], key=lambda x: x[0])
+        merged   = sorted(all_cf, key=lambda x: x[0])
         xi       = xirr(merged) if merged else None
         xi_color = "#3fb950" if xi and xi >= 0 else "#f85149"
-        short = funds[0]["name"][:30] + "…" if len(funds[0]["name"]) > 30 else funds[0]["name"]
-        self._set_card_label(self.card_invested, f"Invested · {short}")
+        
+        # Show count of active vs total funds
+        total_count = len(self.portfolio)
+        active_count = len(active_funds)
+        count_suffix = f" ({active_count}/{total_count})" if active_count < total_count else ""
+        
+        self._set_card_label(self.card_invested, f"Total Invested{count_suffix}")
         self._set_card_label(self.card_current,  "Current Value")
-        self._set_card_label(self.card_pl,        "P&L")
-        self._set_card_label(self.card_xirr,      "XIRR")
+        self._set_card_label(self.card_pl,       "P&L")
+        self._set_card_label(self.card_xirr,     "Portfolio XIRR")
         self._update_card(self.lbl_invested, f"₹{total_inv:,.0f}")
         self._update_card(self.lbl_current,  f"₹{total_cur:,.0f}")
-        self._update_card(self.lbl_pl,       f"₹{total_pl:+,.0f}  ({pl_pct:+.1f}%)", pl_color)
+        self._update_card(self.lbl_pl,       f"₹{total_pl:+,.0f}", pl_color)
         self._update_card(self.lbl_xirr,     f"{xi:.2f}%" if xi is not None else "—", xi_color)
 
     def _update_cards_portfolio(self):
@@ -1339,12 +1356,15 @@ class MFTracker(QMainWindow):
             inv, cur, _, _, _ = self._compute_fund_stats(fund)
             total_inv += inv
             total_cur += cur
-            all_cf.append([(fund["purchase_date"], -inv),
-                           (datetime.date.today().isoformat(), cur)])
+            # Add XIRR cashflow using historical NAV basis
+            all_cf.append((fund["purchase_date"], -self._get_xirr_invested_amount(fund)))
+        # Add single current value cashflow (positive) for today
+        if all_cf:
+            all_cf.append((datetime.date.today().isoformat(), total_cur))
         total_pl = total_cur - total_inv
         pl_color = "#3fb950" if total_pl >= 0 else "#f85149"
-        merged   = sorted([i for cf in all_cf for i in cf], key=lambda x: x[0])
-        xi_port  = xirr(merged) if merged else None
+        merged   = sorted(all_cf, key=lambda x: x[0])
+        xi_port  = xirr(merged) if len(merged) >= 2 else None
         xi_color = "#3fb950" if xi_port and xi_port >= 0 else "#f85149"
         
         # Show count of active vs total funds
@@ -1366,6 +1386,30 @@ class MFTracker(QMainWindow):
         col = self._sort_col
         if col is None:
             return list(funds)
+        
+        # Pre-calculate consolidated XIRR for sorting (same logic as _refresh_table)
+        scheme_xirr_for_sort = {}
+        if col == 10:  # XIRR column
+            scheme_groups = {}
+            for fund in funds:
+                scheme_code = fund["scheme_code"]
+                if scheme_code not in scheme_groups:
+                    scheme_groups[scheme_code] = []
+                scheme_groups[scheme_code].append(fund)
+            
+            for scheme_code, scheme_funds in scheme_groups.items():
+                all_cf = []
+                total_cur = 0
+                for fund in scheme_funds:
+                    history = fund.get("nav_history", [])
+                    current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
+                    current_val = fund["units"] * current_nav
+                    total_cur += current_val
+                    all_cf.append((fund["purchase_date"], -self._get_xirr_invested_amount(fund)))
+                all_cf.append((datetime.date.today().isoformat(), total_cur))
+                merged = sorted(all_cf, key=lambda x: x[0])
+                scheme_xirr_for_sort[scheme_code] = xirr(merged) if len(merged) >= 2 else None
+        
         def sort_key(fund):
             history     = fund.get("nav_history", [])
             current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
@@ -1373,8 +1417,10 @@ class MFTracker(QMainWindow):
             current_val = fund["units"] * current_nav
             pl          = current_val - invested
             pl_pct      = (pl / invested * 100) if invested else 0
-            xi          = xirr([(fund["purchase_date"], -invested),
-                                 (datetime.date.today().isoformat(), current_val)]) or 0
+            # Use consolidated XIRR for sorting (matching display)
+            xi          = scheme_xirr_for_sort.get(fund["scheme_code"], 0) if col == 10 else 0
+            if xi is None:
+                xi = 0
             is_active   = fund.get("is_active", True)
             # Return appropriate value based on column
             values = [fund["name"].lower(), fund["scheme_code"], fund["units"],
@@ -1779,28 +1825,6 @@ class MFTracker(QMainWindow):
         header.setMinimumSectionSize(100)
         header.setDefaultSectionSize(150)
         
-        # Apply header styling with proper text display
-        self.gl_table.setStyleSheet(
-            self.gl_table.styleSheet() +
-            """
-            QHeaderView::section {
-                background-color: #1f6feb;
-                color: #ffffff;
-                padding: 12px 10px;
-                border: none;
-                border-right: 1px solid #0d1117;
-                border-bottom: 3px solid #58a6ff;
-                font-weight: bold;
-                font-size: 13px;
-                min-height: 40px;
-                max-height: 40px;
-            }
-            QHeaderView::section:hover {
-                background-color: #388bfd;
-            }
-            """
-        )
-        
         # Enable sorting
         self.gl_table.setSortingEnabled(True)
         
@@ -1810,7 +1834,7 @@ class MFTracker(QMainWindow):
         self.gl_table.setAlternatingRowColors(True)
         self.gl_table.verticalHeader().setVisible(False)
         
-        # Table styling
+        # Table + header styling in one stylesheet so header rules are not overwritten
         self.gl_table.setStyleSheet(
             "QTableWidget { "
             "alternate-background-color: #161b22; "
@@ -1820,6 +1844,21 @@ class MFTracker(QMainWindow):
             "}"
             "QTableWidget::item { padding: 8px; }"
             "QTableWidget::item:selected { background-color: #1f6feb; }"
+            "QHeaderView::section {"
+            "background-color: #1f6feb;"
+            "color: #ffffff;"
+            "padding: 12px 10px;"
+            "border: none;"
+            "border-right: 1px solid #0d1117;"
+            "border-bottom: 3px solid #58a6ff;"
+            "font-weight: bold;"
+            "font-size: 13px;"
+            "min-height: 40px;"
+            "max-height: 40px;"
+            "}"
+            "QHeaderView::section:hover {"
+            "background-color: #388bfd;"
+            "}"
         )
         
         # Remove minimum height constraint and let it expand
@@ -1834,6 +1873,7 @@ class MFTracker(QMainWindow):
         """Calculate gain/loss for the selected date range."""
         # Only calculate for active funds
         active_funds = self._get_active_funds()
+
         
         if not active_funds:
             QMessageBox.information(self, "Empty Portfolio", "No active funds in portfolio to calculate.")
@@ -1845,7 +1885,11 @@ class MFTracker(QMainWindow):
         if start_date >= end_date:
             QMessageBox.warning(self, "Invalid Range", "End date must be after start date.")
             return
-        
+        # Only consider funds purchased on or before the period start date
+        active_funds = [
+            f for f in active_funds
+            if datetime.datetime.strptime(f["purchase_date"], "%Y-%m-%d").date() <= self.gl_start_date.date()
+        ]
         # Group funds by name and consolidate units
         fund_groups = {}
         
@@ -2120,8 +2164,7 @@ class MFTracker(QMainWindow):
         import datetime
         
         active_funds = self._get_active_funds()
-        if not active_funds:
-            return 0.0, 0.0
+        
         
         today = datetime.date.today()
         
@@ -2129,7 +2172,9 @@ class MFTracker(QMainWindow):
         if period_type == "last_working_day":
             # Get last working day NAV (2 days back since NAV is available only on next working date)
             start_date = today - datetime.timedelta(days=2)
-            if start_date.weekday() >= 5:  # Saturday is 5, Sunday is 6
+            if today.weekday() == 6:  # Saturday is 5, Sunday is 6
+                start_date = today - datetime.timedelta(days=3)  # Go back to Thursday if weekday is Saturday/Sunday
+            if today.weekday() == 7:  # Saturday is 5, Sunday is 6
                 start_date = today - datetime.timedelta(days=4)  # Go back to Thursday if weekday is Saturday/Sunday
         elif period_type == "last_week":
             start_date = today - datetime.timedelta(days=7)
@@ -2142,7 +2187,9 @@ class MFTracker(QMainWindow):
         
         start_date_str = start_date.strftime("%Y-%m-%d")
         end_date_str = today.strftime("%Y-%m-%d")
+
         
+
         # Group funds by name and consolidate units
         fund_groups = {}
         
@@ -2476,6 +2523,29 @@ scheme_code,name,units,purchase_nav,purchase_date
     # ── Table refresh ─────────────────────────────────────────────────────────
     def _refresh_table(self):
         self.table.setRowCount(0)
+        
+        # Pre-calculate consolidated XIRR for each scheme_code
+        scheme_xirr = {}
+        scheme_groups = {}
+        for fund in self.portfolio:
+            scheme_code = fund["scheme_code"]
+            if scheme_code not in scheme_groups:
+                scheme_groups[scheme_code] = []
+            scheme_groups[scheme_code].append(fund)
+        
+        # Calculate consolidated XIRR for each scheme
+        for scheme_code, funds in scheme_groups.items():
+            all_cf = []
+            total_cur = 0
+            for fund in funds:
+                inv, cur, _, _, _ = self._compute_fund_stats(fund)
+                total_cur += cur
+                # Add XIRR cashflow using historical NAV basis
+                all_cf.append((fund["purchase_date"], -self._get_xirr_invested_amount(fund)))
+            # Add single current value cashflow (positive) for today
+            all_cf.append((datetime.date.today().isoformat(), total_cur))
+            merged = sorted(all_cf, key=lambda x: x[0])
+            scheme_xirr[scheme_code] = xirr(merged) if len(merged) >= 2 else None
 
         for fund in self._apply_sort(self.portfolio):
             row = self.table.rowCount()
@@ -2488,7 +2558,10 @@ scheme_code,name,units,purchase_nav,purchase_date
             is_active = fund.get("is_active", True)
             
             # Use new improved calculation method (with real NAVs)
-            invested, current_val, pl, pl_pct, xi = self._compute_fund_stats(fund)
+            invested, current_val, pl, pl_pct, _ = self._compute_fund_stats(fund)
+            
+            # Use consolidated XIRR for the scheme
+            xi = scheme_xirr.get(fund["scheme_code"])
             
             history = fund.get("nav_history", [])
             current_nav = history[-1]["nav"] if history else fund["purchase_nav"]
@@ -2503,29 +2576,66 @@ scheme_code,name,units,purchase_nav,purchase_date
 
             self.table.setItem(row, 0, cell(fund["name"], Qt.AlignLeft))
             self.table.setItem(row, 1, cell(fund["scheme_code"]))
-            self.table.setItem(row, 2, cell(f"{fund['units']:.3f}"))
-            self.table.setItem(row, 3, cell(f"{fund['purchase_nav']:.4f}"))
+            
+            # Use NumericTableWidgetItem for numeric columns
+            units_item = NumericTableWidgetItem(f"{fund['units']:.3f}", fund['units'])
+            units_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if not is_active:
+                units_item.setForeground(QColor("#6e7681"))
+            self.table.setItem(row, 2, units_item)
+            
+            pnav_item = NumericTableWidgetItem(f"{fund['purchase_nav']:.4f}", fund['purchase_nav'])
+            pnav_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if not is_active:
+                pnav_item.setForeground(QColor("#6e7681"))
+            self.table.setItem(row, 3, pnav_item)
+            
             self.table.setItem(row, 4, cell(fund["purchase_date"]))
-            self.table.setItem(row, 5, cell(f"{current_nav:.4f}"))
-            self.table.setItem(row, 6, cell(f"₹{invested:,.2f}"))
-            self.table.setItem(row, 7, cell(f"₹{current_val:,.2f}"))
+            
+            cnav_item = NumericTableWidgetItem(f"{current_nav:.4f}", current_nav)
+            cnav_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if not is_active:
+                cnav_item.setForeground(QColor("#6e7681"))
+            self.table.setItem(row, 5, cnav_item)
+            
+            inv_item = NumericTableWidgetItem(f"₹{invested:,.2f}", invested)
+            inv_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if not is_active:
+                inv_item.setForeground(QColor("#6e7681"))
+            self.table.setItem(row, 6, inv_item)
+            
+            cur_item = NumericTableWidgetItem(f"₹{current_val:,.2f}", current_val)
+            cur_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if not is_active:
+                cur_item.setForeground(QColor("#6e7681"))
+            self.table.setItem(row, 7, cur_item)
 
-            pl_item = cell(f"₹{pl:,.2f}")
+            pl_item = NumericTableWidgetItem(f"₹{pl:,.2f}", pl)
+            pl_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             pl_color = "#3fb950" if pl >= 0 else "#f85149"
             if not is_active:
                 pl_color = "#6e7681"
             pl_item.setForeground(QColor(pl_color))
             self.table.setItem(row, 8, pl_item)
 
-            pct_item = cell(f"{pl_pct:+.2f}%")
+            pct_item = NumericTableWidgetItem(f"{pl_pct:+.2f}%", pl_pct)
+            pct_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             pct_color = "#3fb950" if pl_pct >= 0 else "#f85149"
             if not is_active:
                 pct_color = "#6e7681"
             pct_item.setForeground(QColor(pct_color))
             self.table.setItem(row, 9, pct_item)
 
-            xi_item = cell(f"{xi:.2f}%" if xi is not None else "—")
-            if xi is not None and is_active:
+            # Use NumericTableWidgetItem for XIRR to enable proper numeric sorting
+            xi_numeric_value = xi if xi is not None else float('-inf')  # Put None values at the end
+            xi_item = NumericTableWidgetItem(
+                f"{xi:.2f}%" if xi is not None else "—",
+                xi_numeric_value
+            )
+            xi_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if not is_active:
+                xi_item.setForeground(QColor("#6e7681"))
+            elif xi is not None:
                 xi_item.setForeground(QColor("#3fb950" if xi >= 0 else "#f85149"))
             self.table.setItem(row, 10, xi_item)
 
@@ -2598,6 +2708,7 @@ scheme_code,name,units,purchase_nav,purchase_date
             self.chart.plot_compare(active_funds, years=self._chart_years)
         else:
             self._plot_selected(self.fund_selector.currentIndex())
+        self._plot_worth()
 
     def _populate_fund_selector(self):
         self.fund_selector.blockSignals(True)
