@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QHeaderView, QFrame, QScrollArea, QSplitter, QDoubleSpinBox,
     QDialog, QFormLayout, QDialogButtonBox, QProgressBar, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QDate, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, QDate, QThread, pyqtSignal, QTimer, QVariant
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon
 
 import bisect
@@ -889,6 +889,62 @@ class NavChart(FigureCanvas):
         self._store_and_draw(series, "compare")
         self.draw()
 
+    def plot_compare_selected(self, funds, years=None):
+        """Plot comparison of selected funds only."""
+        self._clear_twin()
+        self.ax.clear()
+        self._style_ax()
+        self._clear_crosshair()
+        self._plot_data = []
+        self.ax.set_ylabel("Indexed Return (Base = 100)", color="#8b949e", fontsize=9)
+
+        if not funds:
+            self.ax.text(0.5, 0.5, "Select funds from the list above to compare.",
+                         ha="center", va="center", color="#8b949e", fontsize=11,
+                         transform=self.ax.transAxes)
+            self.draw()
+            return
+
+        all_dates = []
+        plotted = 0
+        series = []
+        for i, fund in enumerate(funds):
+            history = fund.get("nav_history", [])
+            if years is not None:
+                cutoff = (datetime.datetime.now() - datetime.timedelta(days=years * 365)).date()
+                history = [h for h in history if datetime.date.fromisoformat(h["date"]) >= cutoff]
+            if not history:
+                continue
+            color = COMPARE_COLORS[i % len(COMPARE_COLORS)]
+            purchase_nav = fund["purchase_nav"]
+            dates   = [datetime.datetime.strptime(h["date"], "%Y-%m-%d") for h in history]
+            indexed = [(h["nav"] / purchase_nav) * 100 for h in history]
+            short   = fund["name"][:28] + "…" if len(fund["name"]) > 28 else fund["name"]
+
+            self.ax.plot(dates, indexed, color=color, linewidth=1.8, label=short, zorder=3)
+            self.ax.fill_between(dates, indexed, 100, alpha=0.07, color=color)
+            all_dates.extend(dates)
+            series.append((dates, indexed, fund["name"], color))
+            plotted += 1
+
+        if plotted == 0:
+            self.ax.text(0.5, 0.5, "No NAV data to compare.\nClick 'Refresh NAV' first.",
+                         ha="center", va="center", color="#8b949e", fontsize=11,
+                         transform=self.ax.transAxes)
+            self.draw()
+            return
+
+        self.ax.axhline(100, color="#e3b341", linewidth=1.0, linestyle="--",
+                        label="Buy price (100)", zorder=2)
+        self._format_xaxis(sorted(all_dates))
+        self.ax.set_title(f"Selected Funds Comparison — Indexed to Purchase Price ({plotted} funds)",
+                          color="#e6edf3", fontsize=10, pad=8)
+        self.ax.legend(facecolor="#161b22", edgecolor="#30363d",
+                       labelcolor="#e6edf3", fontsize=7.5,
+                       loc="upper left", framealpha=0.9)
+        self._store_and_draw(series, "compare")
+        self.draw()
+
     def plot_worth(self, funds, years=None):
         self._clear_twin()
         self.ax.clear()
@@ -1604,6 +1660,11 @@ class MFTracker(QMainWindow):
         self.btn_compare.setFixedWidth(110)
         self.btn_compare.clicked.connect(self._switch_to_compare)
 
+        self.btn_compare_selected = QPushButton("Compare Selected")
+        self.btn_compare_selected.setCheckable(True)
+        self.btn_compare_selected.setFixedWidth(130)
+        self.btn_compare_selected.clicked.connect(self._switch_to_compare_selected)
+
         # Time range dropdown
         self._chart_years = None   # None = all time
         self.year_filter = QComboBox()
@@ -1621,14 +1682,27 @@ class MFTracker(QMainWindow):
         self.compare_hint.setStyleSheet("color: #8b949e; font-size: 11px;")
         self.compare_hint.setVisible(False)
 
+        # Multi-select list for compare selected mode
+        from PyQt5.QtWidgets import QListWidget
+        self.fund_multi_selector = QListWidget()
+        self.fund_multi_selector.setSelectionMode(QListWidget.MultiSelection)
+        self.fund_multi_selector.setMinimumWidth(300)
+        self.fund_multi_selector.setMaximumHeight(150)
+        self.fund_multi_selector.setVisible(False)
+        self.fund_multi_selector.itemSelectionChanged.connect(self._plot_compare_selected_funds)
+
         chart_ctrl.addWidget(self.btn_single)
         chart_ctrl.addWidget(self.btn_compare)
+        chart_ctrl.addWidget(self.btn_compare_selected)
         chart_ctrl.addSpacing(16)
         chart_ctrl.addWidget(self.year_filter)
         chart_ctrl.addSpacing(12)
         chart_ctrl.addWidget(self.fund_selector)
         chart_ctrl.addWidget(self.compare_hint)
         chart_ctrl.addStretch()
+        
+        # Add multi-selector below the control row
+        chart_layout.addWidget(self.fund_multi_selector, stretch=0)
         chart_layout.addLayout(chart_ctrl, stretch=0)
 
         self.chart = NavChart()
@@ -2670,10 +2744,14 @@ scheme_code,name,units,purchase_nav,purchase_date
         self.btn_single.setChecked(True)
         self.btn_compare.setObjectName("")
         self.btn_compare.setChecked(False)
+        self.btn_compare_selected.setObjectName("")
+        self.btn_compare_selected.setChecked(False)
         self.fund_selector.setVisible(True)
+        self.fund_multi_selector.setVisible(False)
         self.compare_hint.setVisible(False)
         self.btn_single.setStyleSheet("")
         self.btn_compare.setStyleSheet("")
+        self.btn_compare_selected.setStyleSheet("")
         self._plot_selected(self.fund_selector.currentIndex())
 
     def _switch_to_compare(self):
@@ -2681,11 +2759,32 @@ scheme_code,name,units,purchase_nav,purchase_date
         self.btn_compare.setChecked(True)
         self.btn_single.setObjectName("")
         self.btn_single.setChecked(False)
+        self.btn_compare_selected.setObjectName("")
+        self.btn_compare_selected.setChecked(False)
         self.fund_selector.setVisible(False)
+        self.fund_multi_selector.setVisible(False)
         self.compare_hint.setVisible(True)
         self.btn_single.setStyleSheet("")
         self.btn_compare.setStyleSheet("")
+        self.btn_compare_selected.setStyleSheet("")
         self.chart.plot_compare(self.portfolio, years=self._chart_years)
+        self._update_cards_portfolio()
+
+    def _switch_to_compare_selected(self):
+        self.btn_compare_selected.setObjectName("primary")
+        self.btn_compare_selected.setChecked(True)
+        self.btn_single.setObjectName("")
+        self.btn_single.setChecked(False)
+        self.btn_compare.setObjectName("")
+        self.btn_compare.setChecked(False)
+        self.fund_selector.setVisible(False)
+        self.fund_multi_selector.setVisible(True)
+        self.compare_hint.setVisible(False)
+        self.btn_single.setStyleSheet("")
+        self.btn_compare.setStyleSheet("")
+        self.btn_compare_selected.setStyleSheet("")
+        self._populate_fund_multi_selector()
+        self._plot_compare_selected_funds()
         self._update_cards_portfolio()
 
     def _on_year_filter_changed(self, index):
@@ -2706,6 +2805,8 @@ scheme_code,name,units,purchase_nav,purchase_date
         active_funds = self._get_active_funds()
         if self.btn_compare.isChecked():
             self.chart.plot_compare(active_funds, years=self._chart_years)
+        elif self.btn_compare_selected.isChecked():
+            self._plot_compare_selected_funds()
         else:
             self._plot_selected(self.fund_selector.currentIndex())
         self._plot_worth()
@@ -2743,9 +2844,70 @@ scheme_code,name,units,purchase_nav,purchase_date
 
         if self.btn_compare.isChecked():
             self.chart.plot_compare(self.portfolio, years=self._chart_years)
+        elif self.btn_compare_selected.isChecked():
+            self._populate_fund_multi_selector()
+            self._plot_compare_selected_funds()
         else:
             self._plot_selected(self.fund_selector.currentIndex())
         self._plot_worth()
+
+    def _populate_fund_multi_selector(self):
+        """Populate the multi-select list with unique funds."""
+        self.fund_multi_selector.blockSignals(True)
+        
+        # Remember current selections by scheme_code
+        prev_selected = []
+        for i in range(self.fund_multi_selector.count()):
+            item = self.fund_multi_selector.item(i)
+            if item and item.isSelected():
+                prev_selected.append(item.data(256))  # Qt.UserRole = 256
+        
+        self.fund_multi_selector.clear()
+        
+        # Only show active funds
+        active_funds = self._get_active_funds()
+        
+        # One entry per unique scheme_code
+        seen = []
+        for fund in active_funds:
+            code = fund["scheme_code"]
+            if code not in seen:
+                seen.append(code)
+        
+        for code in seen:
+            entries = [f for f in active_funds if f["scheme_code"] == code]
+            name = entries[0]["name"]
+            label = f"{name}  ({len(entries)} SIPs)" if len(entries) > 1 else name
+            
+            from PyQt5.QtWidgets import QListWidgetItem
+            item = QListWidgetItem(label)
+            item.setData(256, code)  # Qt.UserRole = 256, store scheme_code as item data
+            self.fund_multi_selector.addItem(item)
+            
+            # Restore previous selection
+            if code in prev_selected:
+                item.setSelected(True)
+        
+        self.fund_multi_selector.blockSignals(False)
+
+    def _plot_compare_selected_funds(self):
+        """Plot comparison of selected funds from the multi-selector."""
+        selected_items = self.fund_multi_selector.selectedItems()
+        
+        if not selected_items:
+            # No selection, show empty chart with message
+            self.chart.plot_compare_selected([], years=self._chart_years)
+            return
+        
+        # Get scheme codes of selected items
+        selected_codes = [item.data(256) for item in selected_items]  # Qt.UserRole = 256
+        
+        # Get all active funds matching the selected codes
+        active_funds = self._get_active_funds()
+        selected_funds = [f for f in active_funds if f["scheme_code"] in selected_codes]
+        
+        # Plot the selected funds
+        self.chart.plot_compare_selected(selected_funds, years=self._chart_years)
 
     def _plot_selected(self, idx):
         if idx < 0 or self.fund_selector.count() == 0:
